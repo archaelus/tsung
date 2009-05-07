@@ -129,9 +129,11 @@ authenticate(UserId,Passwd)->
     ["Authorization: Basic ",AuthStr,?CRLF].
 
 %%----------------------------------------------------------------------
-%% @spec set_header(Name::string, Val::string | undefined, Headers::List, Default::string)
-%% @doc If headers is defined in <headers>, print this one, otherwise,
+%% @spec set_header(Name::string, Val::string | undefined, Headers::List,
+%%                  Default::string) -> list()
+%% @doc If header Name is defined in Headers, print this one, otherwise,
 %%      print the given Value (or the default one if undefined)
+%% @end
 %%----------------------------------------------------------------------
 set_header(Name, Value, Headers, Default) when length(Headers) > 0 ->
     case  lists:keysearch(Name, 1, Headers) of
@@ -162,7 +164,6 @@ headers(Headers) ->
 %% Args: Cookies (list), Hostname (string), URL
 %% Purpose: set Cookie: Header
 %%----------------------------------------------------------------------
-set_cookie_header({none, _, _}) -> []; % is it useful ?
 set_cookie_header({[], _, _})   -> [];
 set_cookie_header({Cookies, Host, URL})->
     MatchDomain = fun (A) -> matchdomain_url(A,Host,URL) end,
@@ -279,7 +280,7 @@ check_resp_size(#http{content_length=CLength, close = Close},
                 BodySize, DynData, State, DataSize) when BodySize > CLength ->
     ?LOGF("Error: HTTP Body (~p)> Content-Length (~p) !~n",
           [BodySize, CLength], ?ERR),
-    ts_mon:add({ count, http_bad_content_length }),
+    ts_mon:add({ count, error_http_bad_content_length }),
     {State#state_rcv{session= #http{}, ack_done = true,
                      datasize = DataSize,
                      dyndata= DynData}, [], Close};
@@ -332,7 +333,7 @@ read_chunk(<<Char:1/binary, Data/binary>>, State, Int, Acc) ->
         read_chunk(Data, State, Int, Acc+1);
     _Other ->
             ?LOGF("Unexpected error while parsing chunk ~p~n", [_Other] ,?WARN),
-            ts_mon:add({count, http_unexpected_chunkdata}),
+            ts_mon:add({count, error_http_unexpected_chunkdata}),
             {State#state_rcv{session= #http{}, ack_done = true}, []}
     end.
 
@@ -505,8 +506,11 @@ http_method("move")-> 'MOVE';
 http_method("lock")-> 'LOCK';
 http_method("unlock")-> 'UNLOCK';
 http_method("mkcol")-> 'MKCOL';
+http_method("mkactivity")-> 'MKACTIVITY';
 http_method("report")-> 'REPORT';
 http_method("options")-> 'OPTIONS';
+http_method("checkout")-> 'CHECKOUT';
+http_method("merge")-> 'MERGE';
 http_method(Method) ->
     ?LOGF("Unknown  HTTP method: ~p~n", [Method] ,?WARN),
     not_implemented.

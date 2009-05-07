@@ -31,7 +31,7 @@
 -module(ts_search).
 -vc('$Id$ ').
 
--export([subst/2, match/3, parse_dynvar/2]).
+-export([subst/2, match/4, parse_dynvar/2]).
 
 -include("ts_profile.hrl").
 
@@ -43,9 +43,9 @@
 %%          be used in tsung.xml scenarii files.
 %% Returns: new string
 %% ----------------------------------------------------------------------
-subst(Atom, _DynVar) when atom(Atom) ->
+subst(Atom, _DynVar) when is_atom(Atom) ->
     Atom;
-subst(Binary, DynVar) when binary(Binary) ->
+subst(Binary, DynVar) when is_binary(Binary) ->
     list_to_binary(subst(binary_to_list(Binary), DynVar));
 subst(String, DynVar) ->
     subst(String, DynVar, []).
@@ -71,15 +71,14 @@ extract_module([H|Tail],DynVar, Acc, Mod) ->
 %% Search for the module string in the subst markup
 extract_variable([],_DynVar,Acc,_) ->
     lists:reverse(Acc);
-extract_variable([$%,$%|Tail], undefined, Acc, _Var) ->
-    subst(Tail, undefined, lists:reverse("undefined") ++ Acc);
 extract_variable([$%,$%|Tail], DynVar, Acc, Var) ->
     VarName = list_to_atom(lists:reverse(Var)),
-    case lists:keysearch(VarName,1,DynVar) of
-        {value, {VarName, Result}} ->
+    case ts_dynvars:lookup(VarName,DynVar) of
+        {ok, ResultTmp} ->
+            Result=ts_utils:term_to_list(ResultTmp),
             ?DebugF("found value ~p for name ~p~n",[Result,VarName]),
             subst(Tail, DynVar,lists:reverse(Result) ++ Acc);
-        _ ->
+        false ->
             ?LOGF("DynVar: no value found for var ~p~n",[VarName],?WARN),
             subst(Tail, DynVar,lists:reverse("undefined") ++ Acc)
     end;
@@ -110,24 +109,51 @@ extract_function([H|Tail],DynVar,  Acc, Mod, Fun) ->
     extract_function(Tail, DynVar, Acc, Mod, [H|Fun]).
 
 %%----------------------------------------------------------------------
-%% Func: match/3
-%% Args: RegExp, Data, Request Counter
-%% Returns:  New Counter ( not changed if match )
-%% Purpose: search for regexp in Data; send result to ts_mon
+%% @spec match(Match::#match{}, Data::binary() | list, {Counts::integer(),
+%% Max::integer(), SessionId::integer(),UserId::integer()}, Dynvars::term()
+%%  ) ->  Count::integer()
+%% @doc search for regexp in Data; send result to ts_mon
+%% @end
 %%----------------------------------------------------------------------
-match([], _Data, {Count, _MaxC}) -> Count;
-match(Match, Data, Counts)  when is_binary(Data)->
-    ?DebugF("Matching Data size ~p~n",[size(Data)]),
-    match(Match, binary_to_list(Data), Counts, []);
-match(Match, Data, Counts)  ->
-    match(Match, Data, Counts, []).
+match([], _Data, {Count, _MaxC, _SessionId, _UserId}, _DynVars) -> Count;
+match([Match=#match{'skip_headers'=http}|Tail], Data, Counts,DynVars) when is_binary(Data)->
+    %% keep http body only
+    case re:run(Data,"\\r\\n\\r\\n(.*)",[{capture,all_but_first,binary},dotall]) of
+        {match,[NewData]} ->
+            match([Match#match{'skip_headers'=no}|Tail], NewData, Counts, DynVars);
+        _ ->
+            ?LOGF("Skip http headers failure, data was: ~p ~n",[Data], ?ERR),
+            match([Match#match{'skip_headers'=no}|Tail], Data, Counts, DynVars)
+        end;
 
-%% Func: match/4
-match([], _Data, {Count, _MaxC}, Stats) ->
+match([Match=#match{'apply_to_content'=undefined}|Tail], Data, Counts,DynVars) when is_binary(Data)->
+    ?DebugF("Matching Data size ~p; apply undefined~n",[size(Data)]),
+    match([Match|Tail], binary_to_list(Data), Counts, DynVars);
+match([Match=#match{'apply_to_content'={Module,Fun}}|Tail], Data, Counts,DynVars) when is_binary(Data)->
+    ?DebugF("Matching Data size ~p; apply ~p:~p~n",[size(Data),Module,Fun]),
+    NewData = Module:Fun(Data),
+    ?DebugF("Match: apply result =~p~n",[NewData]),
+    case is_binary(NewData) of
+        true ->
+            match([Match|Tail], binary_to_list(NewData), Counts, DynVars);
+        false->
+            match([Match|Tail], NewData, Counts, DynVars)
+    end;
+match(Match, Data, Counts,DynVars)  when is_list(Data) ->
+    match(Match, Data, Counts, [], DynVars).
+
+%% @spec match(Match::#match{}, Data::binary() | list(), Count::tuple(),
+%%             Stats::list(), DynVars::term()) -> Count::integer()
+match([], _Data, {Count,_, _,_}, Stats, _) ->
     %% all matches done, add stats, and return Count unchanged (continue)
     ts_mon:add(Stats),
     Count;
-match([Match=#match{regexp=RegExp, do=Action, 'when'=When}| Tail], String, Counts, Stats)->
+match([Match=#match{regexp=RawRegExp,subst=Subst, do=Action, 'when'=When}
+       |Tail], String,Counts,Stats,DynVars)->
+    RegExp  = case Subst of
+        true -> subst(RawRegExp, DynVars);
+        _    -> RawRegExp
+    end,
     case regexp:first_match(String, RegExp) of
         {When,_, _} ->
             ?LOGF("Ok Match (regexp=~p) do=~p~n",[RegExp,Action], ?INFO),
@@ -135,25 +161,25 @@ match([Match=#match{regexp=RegExp, do=Action, 'when'=When}| Tail], String, Count
         When -> % nomatch
             ?LOGF("Bad Match (regexp=~p) do=~p~n",[RegExp, Action], ?INFO),
             setcount(Match, Counts, [{count, nomatch} | Stats]);
-        {match,_, _} ->
+        {match,_, _} -> % match but when=nomatch
             ?LOGF("Ok Match (regexp=~p)~n",[RegExp], ?INFO),
             case Action of
                 loop    -> put(loop_count, 0);
                 restart -> put(restart_count, 0);
                 _       -> ok
             end,
-            match(Tail, String, Counts, [{count, match} | Stats]);
-        nomatch ->
+            match(Tail, String, Counts, [{count, match} | Stats],DynVars);
+        nomatch -> % nomatch but when=match
             ?LOGF("Bad Match (regexp=~p)~n",[RegExp], ?INFO),
             case Action of
                 loop    -> put(loop_count, 0);
                 restart -> put(restart_count, 0);
                 _       -> ok
             end,
-            match(Tail, String, Counts,[{count, nomatch} | Stats]);
+            match(Tail, String, Counts,[{count, nomatch} | Stats],DynVars);
         {error,_Error} ->
-            ?LOGF("Error while matching: bad REGEXP (~p)~n", [RegExp], ?WARN),
-            match(Tail, String, Counts,[{count, badregexp} | Stats])
+            ?LOGF("Error while matching: bad REGEXP (~p)~n", [RegExp], ?ERR),
+            match(Tail, String, Counts,[{count, badregexp} | Stats],DynVars)
     end.
 
 %%----------------------------------------------------------------------
@@ -164,27 +190,31 @@ match([Match=#match{regexp=RegExp, do=Action, 'when'=When}| Tail], String, Count
 %%   - if restart is true, we must start again the whole session, set count to MaxCount
 %%   - if stop is true, set count to 0
 %%----------------------------------------------------------------------
-setcount(#match{do=continue}, {Count, _MaxC}, Stats)->
+setcount(#match{do=continue}, {Count, _MaxC, _SessionId, _UserId}, Stats)->
     ts_mon:add(Stats),
     Count;
-setcount(#match{do=restart, max_restart=MaxRestart}, {_Count, MaxC}, Stats)->
+setcount(#match{do=log}, {Count, MaxC, SessionId, UserId}, Stats)->
+    ts_mon:add_match(Stats,{UserId,SessionId,MaxC-Count}),
+    Count;
+setcount(#match{do=restart, max_restart=MaxRestart}, {Count, MaxC,SessionId,UserId}, Stats)->
     CurRestart = get(restart_count),
+    Ids={UserId,SessionId,MaxC-Count},
     ?LOGF("Restart on (no)match ~p~n",[CurRestart], ?INFO),
     case CurRestart of
         undefined ->
             put(restart_count,1),
-            ts_mon:add([{count, match_restart} | Stats]),
+            ts_mon:add_match([{count, match_restart} | Stats],Ids),
             MaxC ;
         Val when Val > MaxRestart ->
             ?LOG("Max restart reached, abort ! ~n", ?WARN),
-            ts_mon:add([{count, match_restart_abort} | Stats]),
+            ts_mon:add_match([{count, match_restart_abort} | Stats],Ids),
             0;
         Val ->
             put(restart_count, Val +1),
-            ts_mon:add([{count, match_restart} | Stats]),
+            ts_mon:add_match([{count, match_restart} | Stats],Ids),
             MaxC
     end;
-setcount(#match{do=loop,loop_back=Back,max_loop=MaxLoop,sleep_loop=Sleep},{Count,_MaxC},Stats)->
+setcount(#match{do=loop,loop_back=Back,max_loop=MaxLoop,sleep_loop=Sleep},{Count,_MaxC,_SessionId,_UserId},Stats)->
     CurLoop = get(loop_count),
     ?LOGF("Loop on (no)match ~p~n",[CurLoop], ?INFO),
     ts_mon:add([{count, match_loop} | Stats]),
@@ -202,80 +232,74 @@ setcount(#match{do=loop,loop_back=Back,max_loop=MaxLoop,sleep_loop=Sleep},{Count
             timer:sleep(Sleep),
             Count + 1 + Back
     end;
-setcount(#match{do=abort}, _, Stats) ->
-    ts_mon:add([{count, match_stop} | Stats]),
+setcount(#match{do=abort}, {Count,MaxC,SessionId,UserId}, Stats) ->
+    ts_mon:add_match([{count, match_stop} | Stats],{UserId,SessionId,MaxC-Count}),
     0.
 
 %%----------------------------------------------------------------------
 %% Func: parse_dynvar/2
-%% Args: DynVar, Data
+%% Args: DynVarSpecs, Data
 %% Purpose: look for dynamic variables in Data
-%% Returns: List
+%% Returns: DynVars (List)
 %%----------------------------------------------------------------------
-parse_dynvar(undefined, _Data) -> [];
-parse_dynvar(DynVar, Data)  when is_binary(Data) ->
-    ?DebugF("Parsing Dyn Variable; data is ~p~n",[Data]),
-    parse_dynvar(DynVar,Data, undefined,undefined,[]);
-parse_dynvar(DynVar, _Data)  ->
-    ?LOGF("Error while Parsing dyn Variable(~p)~n",[DynVar],?WARN),
-    [].
+parse_dynvar([], _Data) -> ts_dynvars:new();
+parse_dynvar(DynVarSpecs, Data)  when is_binary(Data) ->
+    ?DebugF("Parsing Dyn Variable (specs=~p); data is ~p~n",[DynVarSpecs,Data]),
+    parse_dynvar(DynVarSpecs,Data, undefined,undefined,[]);
+parse_dynvar(DynVarSpecs, _Data)  ->
+    ?LOGF("Error while Parsing dyn Variable(~p)~n",[DynVarSpecs],?WARN),
+    ts_dynvars:new().
 
 % parse_dynvar(DynVars,BinaryData,ListData,TreeData,Accum)
 %            ListData and TreeData are lazy computed when needed by
 %            regexp or xpath variables respectively
-parse_dynvar([],_Binary , _String,_Tree, ValuesList) -> ValuesList;
+parse_dynvar([],_Binary , _String,_Tree, DynVars) -> DynVars;
 
-parse_dynvar(D=[{regexp,_VarName, _RegExp}| _DynVars],
-                Binary,undefined,Tree, ValuesList) ->
-    parse_dynvar(D,Binary,binary_to_list(Binary),Tree,ValuesList);
+parse_dynvar(D=[{regexp,_VarName, _RegExp}| _DynVarsSpecs],
+                Binary,undefined,Tree, DynVars) ->
+    parse_dynvar(D,Binary,binary_to_list(Binary),Tree,DynVars);
 
-parse_dynvar([{regexp,VarName, RegExp}| DynVars],
-                Binary,String,Tree, ValuesList) ->
+parse_dynvar([{regexp,VarName, RegExp}| DynVarsSpecs],
+                Binary,String,Tree, DynVars) ->
     case gregexp:groups(String, RegExp) of
         {match,[Value|_]} ->
             ?LOGF("DynVar: Match (~p=~p) ~n",[VarName, Value], ?DEB),
-            parse_dynvar(DynVars, Binary,String,Tree,
-                            [{VarName, Value}| ValuesList]);
+            parse_dynvar(DynVarsSpecs, Binary,String,Tree,
+                            ts_dynvars:set(VarName,Value,DynVars));
         nomatch ->
             ?LOGF("Dyn Var: no Match (varname=~p), ~n",[VarName], ?WARN),
-            parse_dynvar(DynVars, Binary,String,Tree, [{VarName, ""}|ValuesList])
+            parse_dynvar(DynVarsSpecs, Binary,String,Tree, ts_dynvars:set(VarName,"",DynVars))
     end;
 
-parse_dynvar(D=[{xpath,_VarName, _Expr}| _DynVars],
-                Binary,String,undefined,ValuesList) ->
+parse_dynvar(D=[{xpath,_VarName, _Expr}| _DynVarsSpecs],
+                Binary,String,undefined,DynVars) ->
     HTML = extract_html(Binary),
     try mochiweb_html:parse(HTML) of
         Tree ->
-            parse_dynvar(D,Binary,String,Tree,ValuesList)
+            parse_dynvar(D,Binary,String,Tree,DynVars)
     catch
         Type:Exp ->
             ?LOGF("Page couldn't be parsed:(~p:~p) ~n Page:~p~n",
                     [Type,Exp,Binary],?ERR),
-            parse_dynvar(D,Binary,String,error,ValuesList)
+            parse_dynvar(D,Binary,String,error,DynVars)
     end;
 
-parse_dynvar([{xpath,VarName, _Expr}| DynVars],
-                Binary,String,error,ValuesList) ->
+parse_dynvar([{xpath,VarName,_Expr}|DynVarsSpecs],Binary,String,error,DynVars)->
     ?LOGF("Couldn't execute XPath: page not parsed (varname=~p) ~n",
-                [VarName],?ERR),
-    parse_dynvar(DynVars, Binary,String,error,ValuesList);
+          [VarName],?ERR),
+    parse_dynvar(DynVarsSpecs, Binary,String,error,DynVars);
 
-parse_dynvar([{xpath,VarName, Expr}| DynVars],
-                Binary,String,Tree, ValuesList) ->
-        Result = mochiweb_xpath:execute(Expr,Tree),
-        Value = mochiweb_xpath_utils:string_value(Result),
-        case binary_to_list(Value) of
-            [] ->
-                ?LOGF("Dyn Var: no Match (varname=~p), ~n",[VarName],?WARN),
-                parse_dynvar(DynVars, Binary,String,Tree,[{VarName, ""}|ValuesList]);
-            ListValue ->
-                ?LOGF("Dyn Var: Match (~p=~p), ~n",[VarName,ListValue],?DEB),
-                parse_dynvar(DynVars, Binary,String,Tree,
-                            [{VarName, ListValue}| ValuesList])
-        end;
+parse_dynvar([{xpath,VarName, Expr}| DynVarsSpecs],Binary,String,Tree,DynVars)->
+    Result = mochiweb_xpath:execute(Expr,Tree),
+    Value  = mochiweb_xpath_utils:string_value(Result),
+    ListValue = binary_to_list(Value),
+    case ListValue of
+        [] -> ?LOGF("Dyn Var: no Match (varname=~p), ~n",[VarName],?WARN);
+        _  -> ?LOGF("Dyn Var: Match (~p=~p), ~n",[VarName,ListValue],?DEB)
+    end,
+    parse_dynvar(DynVarsSpecs, Binary,String,Tree,ts_dynvars:set(VarName,ListValue,DynVars));
 
-
-parse_dynvar(Args, _Binary,_String,_Tree, _Values) ->
+parse_dynvar(Args, _Binary,_String,_Tree, _DynVars) ->
     ?LOGF("Bad args while parsing Dyn Var (~p)~n", [Args], ?ERR),
     [].
 

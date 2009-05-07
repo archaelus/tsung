@@ -105,21 +105,27 @@ parse_config(Element, Conf) ->
 %%----------------------------------------------------------------------
 add_dynparams(false, DynData, Param, HostData) ->
     add_dynparams(DynData#dyndata.proto, Param, HostData);
-add_dynparams(true, DynData, Param=#http_request{url=OldUrl}, HostData) ->
-    NewParam = subst(Param, DynData#dyndata.dynvars),
-    case NewParam#http_request.url of
+add_dynparams(true, DynData, OldReq=#http_request{url=OldUrl}, HostData) ->
+    Req = subst(OldReq, DynData#dyndata.dynvars),
+    case Req#http_request.url of
         OldUrl ->
-            add_dynparams(DynData#dyndata.proto,NewParam, HostData);
+            add_dynparams(DynData#dyndata.proto,Req, HostData);
         "http" ++ _Rest -> % URL has changed and is absolute
-            URL=ts_config_http:parse_URL(NewParam#http_request.url),
+            URL=ts_config_http:parse_URL(Req#http_request.url),
             ?DebugF("URL dynamic subst: ~p~n",[URL]),
             NewPort = ts_config_http:set_port(URL),
-            {add_dynparams(DynData#dyndata.proto,
-                          NewParam#http_request{host_header=undefined},
-                          { URL#url.host, NewPort}),
-             {URL#url.host, NewPort,ts_config_http:set_scheme(URL#url.scheme)}};
+            NewUrl = case OldUrl of
+                         "http"++_ -> % old url absolute: useproxy must be true
+                             URL;
+                         _ ->
+                             ts_config_http:set_query(URL)
+                     end,
+            NewReq=add_dynparams(DynData#dyndata.proto,
+                                 Req#http_request{url=NewUrl,host_header=undefined},
+                                 {URL#url.host, NewPort}),
+            {NewReq, {URL#url.host, NewPort,ts_config_http:set_scheme(URL#url.scheme)}};
         _ -> % Same host:port
-            add_dynparams(DynData#dyndata.proto,NewParam, HostData)
+            add_dynparams(DynData#dyndata.proto, Req, HostData)
     end.
 
 %% Function: add_dynparams/3
@@ -131,9 +137,10 @@ add_dynparams(DynData,Param=#http_request{host_header=undefined}, {Host,Port})->
 add_dynparams(#http_dyndata{cookies=[],user_agent=UA},Param, _) ->
     Param#http_request{user_agent=UA};
 %% cookies
-add_dynparams(#http_dyndata{cookies=DynData,user_agent=UA}, Param, _) ->
+add_dynparams(#http_dyndata{cookies=DynCookie,user_agent=UA}, Req, _) ->
     %% FIXME: should we use the Port value in the Cookie ?
-    Param#http_request{cookie=DynData,user_agent=UA}.
+    Cookie=DynCookie++Req#http_request.cookie,
+    Req#http_request{cookie=Cookie,user_agent=UA}.
 
 init_dynparams() ->
     %% FIXME: optimization: suppress this call if we don't need
@@ -143,11 +150,12 @@ init_dynparams() ->
 
 
 %%----------------------------------------------------------------------
-%% Function: subst/2
-%% Purpose: Replace on the fly dynamic element of the HTTP request For
+%% @spec subst(Req::#http_request{}, DynData::#dyndata{} ) -> #http_request{}
+%% @doc Replace on the fly dynamic element of the HTTP request For
 %%          the moment, we only do dynamic substitution in URL, body,
 %%          userid, passwd, because we see no need for the other HTTP
 %%          request parameters.
+%% @end
 %%----------------------------------------------------------------------
 subst(Req=#http_request{url=URL, body=Body, headers = Headers, userid=UserId, passwd=Passwd}, DynData) ->
     Req#http_request{url = ts_search:subst(URL, DynData),

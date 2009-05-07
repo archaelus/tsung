@@ -7,7 +7,7 @@
 \RCS$Revision$
 \RCS$Date$
 
-\documentclass{IDXDOC-en}
+\documentclass{TSUNG-en}
 \usepackage{shortcuts}
 
 % --------------------------------------------
@@ -183,12 +183,13 @@ distribution (currently exponential)
 
 \subsection{WEBDAV related features}
 
-The Webdav plugin is a superset of the HTTP plugin. It adds the
-following features:
+The Webdav (RFC 4918) plugin is a superset of the HTTP plugin. It adds the
+following features (some versioning extensions to WebDAV (RFC 3253)
+are also supported):
 
 \begin{itemize}
 \item Methods implemented: DELETE, CONNECT, PROPFIND, PROPPATCH, COPY,
-  MOVE, LOCK, UNLOCK, MKCOL, REPORT, OPTIONS
+  MOVE, LOCK, UNLOCK, MKCOL, REPORT, OPTIONS, MKACTIVITY, CHECKOUT, MERGE
 \item Recording of DEPTH, IF, TIMEOUT OVERWRITE, DESTINATION, URL and
   LOCK-TOKEN Headers.
 \end{itemize}
@@ -199,6 +200,7 @@ following features:
 \item Authentication (plain-text, digest and sip-digest)
 \item presence and register messages
 \item Chat messages to online or offline users
+\item MUC: join room, send message in room, change nickname
 \item Roster set and get requests
 \item Global users\verb|'| synchronization can be set on specific actions
 \item raw XML messages
@@ -309,6 +311,8 @@ MacOS-X).
    \item  gnuplot and perl5 (optional; for graphical output with
     \command{tsung\_stats.pl} script).  The Template Toolkit is used for HTML
     reports (see \url{http://template-toolkit.org/})
+   \item  python and mathplotlib (optional; for graphical output with
+    \command{tsung-plotter}).
   \item for distributed tests, you need an ssh access to remote
     machines without password (use a RSA/DSA key without pass-phrase or
     ssh-agent) (rsh is also supported)
@@ -331,12 +335,32 @@ Log files are saved in \file{~/.tsung/log/} . A new sub-directory
 is created for each test using the current date as name
 (\file{~/.tsung/log/20040217-09:40} for ex.)
 
+\subsection{Running}
+
+Two commands are installed in the directory \varname{\$PREFIX/bin}:
+\command{tsung} and \command{tsung-recorder}. A man page is available
+for both commands.
+
+\begin{Verbatim}
+>tsung -h
+Usage: tsung <options> start|stop|debug|status
+Options:
+    -f <file>     set configuration file (default is ~/.tsung/tsung.xml)
+    -l <logfile>  set log file (default is ~/.tsung/log/tsung.log)
+    -i <id>       set controller id (default is empty)
+    -r <command>  set remote connector (default is ssh)
+    -F            use long names (FQDN) for erlang nodes
+    -v            print version information and exit
+    -h            display this help and exit
+\end{Verbatim}
+
 \subsection{Feedback}
 
 Use the Tsung mailing list (see
 \url{https://lists.process-one.net/mailman/listinfo/tsung-users}) if you have
 suggestions or questions about \program{Tsung}. You can also use the
 bugtracker available at \url{https://support.process-one.net/browse/TSUN}.
+You can also try the \#tsung IRC channel on Freenode.
 
 \section{Benchmark approach}
 
@@ -345,8 +369,8 @@ bugtracker available at \url{https://support.process-one.net/browse/TSUN}.
 \subsubsection{Benchmarking a Web server}
 
 \begin{enumerate}
-\item Record one or more sessions: start the recorder with: \command{tsung
-    recorder}, and then configure your browser to use Tsung
+\item Record one or more sessions: start the recorder with:
+  \command{tsung-recorder start}, and then configure your browser to use Tsung
   proxy recorder (the listen port is 8090). A session file will be
   created. For HTTPS recording, use \userinput{http://ssl-} instead of
     \userinput{https://} in your browser.
@@ -360,7 +384,7 @@ server(s). Calculate the normal duration of the scenario and use the
 interarrival time between users and the duration of the phase to estimate
 the number of simultaneous users for each given phase.
 \item Launch benchmark with your first application parameters set-up:
-  \command{tsung start}
+  \command{tsung start} (run \command{man tsung} for more options)
 \item Wait for the end of the test or stop by hand with
   \command{tsung stop} (reports can also be generated during the
   test (see § \ref{sec:statistics-reports}) : the statistics are
@@ -373,7 +397,7 @@ the number of simultaneous users for each given phase.
 
 It's the same approach as HTTP: first you start to record one or more
 sessions with the recorder:
-\command{tsung -p webdav  recorder}
+\command{tsung-recorder -p webdav start}
 
 \subsubsection{Benchmarking a proxy server}
 
@@ -396,13 +420,13 @@ more information.
 
 It's the same approach as HTTP: first you start to record one or more
 sessions with the recorder:
-\command{tsung -p pgsql  recorder}
+\command{tsung-recorder -p pgsql start}
 
 This will start a proxy listening to port 8090 and will proxy requests
 to 127.0.0.0:5432.
 
 To choose another port and/or address:
-\command{tsung -L 5432 -I 10.6.1.1 -P 5433 -p pgsql  recorder}
+\command{tsung-recorder -L 5432 -I 10.6.1.1 -P 5433 -p pgsql start}
 
 This will start a proxy listening to port 5432 and will proxy requests
 to 10.6.1.1:5433.
@@ -428,10 +452,6 @@ There are two differences between HTTP and Jabber testing:
   acknowledgments.
 \end{enumerate}
 
-
-
-There is no recorder for Jabber, so you have to write your sessions by
-hand (an example is provided in \ref{sec:sessions:jabber}).
 
 \subsubsection{Acknowledgments of messages}
 
@@ -576,14 +596,14 @@ for password settings).
 
 The recorder has three plugins: for HTTP, WebDAV and for PostgreSQL.
 
-To start it, run \command{tsung -p <PLUGIN> recorder}, where \varname{PLUGIN} can be
+To start it, run \command{tsung-recorder -p <PLUGIN> start}, where \varname{PLUGIN} can be
 \userinput{http}, \userinput{webdav} or  \userinput{pgsql} for PostgreSQL. The default plugin is \userinput{http}.
 
 
 The proxy is listening to port 8090. You can change the port with
 \userinput{-L portnumber}.
 
-To stop it, use \command{tsung stop\_recorder}.
+To stop it, use \command{tsung-recorder stop}.
 
 The recorded session is created as
 \file{~/.tsung/tsung_recorderYYYMMDD-HH:MM.xml}; if it doesn't work,
@@ -591,7 +611,7 @@ take a look at \file{~/.tsung/log/tsung.log-tsung_recorder@hostname}
 
 During the recording, you can add custom tag in the XML file, this can
 be useful to set transactions or comments:
-\command{tsung record\_tag "<transaction name='login'>''}
+\command{tsung-recorder record\_tag "<transaction name='login'>''}
 
 Once a session has been created, you can insert it in your main configuration
 file, either by editing by hand the file, or by using an ENTITY
@@ -743,11 +763,19 @@ advanced distributed testing:
 
 \subsection{Monitoring}
 
+Tsung is able to monitor remote servers using several backends that
+communicates with remote agent; This
+is configured in the \varname{<monitoring>} section. Available
+statistics are: cpu activity, load average, memory usage.
+
+Several types of remote agents are supported (\userinput{erlang} is the default) :
+
 \subsubsection{Erlang}
 
-\par Scenarios can contain optional monitoring informations. For example,
-here is a cluster monitoring definition based on Erlang agents, for
-a cluster of 6 computers:
+The remote agent is started by Tsung. It use erlang communications to
+retrieve statistics of activity on the server. For example, here is a
+cluster monitoring definition based on Erlang agents, for a cluster of
+6 computers:
 
 \begin{Verbatim}
   <monitoring>
@@ -760,10 +788,20 @@ a cluster of 6 computers:
   </monitoring>
 \end{Verbatim}
 
+
+Note: monitored computers need to be
+accessible through the network, and erlang communcations must be
+allowed (no firewall is better ). SSH (or rsh) needs to be configured to
+allow connection without password on. \strong{You must use the same
+  version of Erlang/OTP on all nodes otherwise it may not work
+  properly !}
+
+If you can't have erlang installed on remote servers, you can use one
+of the other available agents:
+
 \subsubsection{SNMP}
-The type keyword snmp can replace the erlang keyword, if SNMP monitoring
-is preferred. They can be mixed. \userinput{erlang} is the default value for
-monitoring. Since version 1.2.2, you can customize the snmp version,
+The type keyword \userinput{snmp} can replace the erlang keyword, if SNMP monitoring
+is preferred. They can be mixed. Since version 1.2.2, you can customize the snmp version,
 community and port number.
 
 \begin{Verbatim}
@@ -779,18 +817,22 @@ community and port number.
 The default version is \userinput{v1}, default community
 \userinput{public} and default port \userinput{161}.
 
+\subsubsection{Munin}
 
+Since version 1.3.1, tsung is able to retrieve data from a munin-node agent
+(see \url{http://munin.projects.linpro.no/wiki/munin-node}). The \varname{type}
+keyword must be set to \userinput{munin}, for example:
 
-
-\par Note: For Erlang monitoring, monitored computers need to be
-accessible through the network. SSH (or rsh) needs to be configured to
-allow connection without password on. \strong{You must use the same
-  version of Erlang/OTP on all nodes otherwise it may not work
-  properly !}
+\begin{Verbatim}
+  <monitoring>
+    <monitor host="geronimo" type="munin"/>
+    <monitor host="f14-2" type="erlang"></monitor>
+  </monitoring>
+\end{Verbatim}
 
 \subsection{Defining the load progression}
 
-\par The load progression is set-up by defining several arrival phases:
+The load progression is set-up by defining several arrival phases:
 
 \begin{Verbatim}
  <load>
@@ -828,13 +870,29 @@ the theoretical average throughput will be 1000 requests/ sec).
 \subsection{Setting options}
 
 \par Default values can be set-up globally: \varname{thinktime} between requests
-in the scenario and ssl cipher algorithms. These values overrides
+in the scenario,  ssl cipher algorithms, TCP/UDP buffer sizes (the default
+value is 32KB). These values overrides
 those set in session configuration tags if override is true.
 \begin{Verbatim}
   <option name="thinktime" value="3" random="false" override="true"/>
   <option name="ssl_ciphers"
            value="EXP1024-RC4-SHA,EDH-RSA-DES-CBC3-SHA"/>
+  <option name="tcp_snd_buffer" value="16384"></option>
+  <option name="tcp_rcv_buffer" value="16384"></option>
+  <option name="udp_snd_buffer" value="16384"></option>
+  <option name="udp_rcv_buffer" value="16384"></option>
 \end{Verbatim}
+
+A new option is available in version \strong{1.3.1}: hibernate. This
+is used to reduced memory consumption of simulated users during
+thinktimes. By default, hibernation will be activated for thinktimes
+higher than 10sec. This value can be changed like this:
+
+\begin{Verbatim}
+<option name="hibernate" value="5"></option>
+\end{Verbatim}
+
+To disable hibernation, you must set the value to \userinput{infinity}.
 
 \subsubsection{Jabber options}
 \label{sec:jabber-options}
@@ -848,6 +906,7 @@ example of option values for Jabber/XMPP:
   <option type="ts_jabber" name="domain" value="jabber.org" />
   <option type="ts_jabber" name="username" value="myuser" />
   <option type="ts_jabber" name="passwd" value="mypasswd" />
+  <option type="ts_jabber" name="muc_service" value="conference.localhost"/>
 \end{Verbatim}
 
 Using these values, users will be \userinput{myuserXXX} where XXX is an integer in
@@ -861,6 +920,8 @@ If not set in the configuration file, the values will be set to:
 \item username = tsunguser
 \item passwd   = sesame
 \end{itemize}
+
+You can also set the \varname{muc_service} here (see previous example).
 
 \subsubsection{HTTP options}
 
@@ -902,7 +963,7 @@ response time.
 
 \subsubsection{Thinktimes}
 
-You can set static or random thinktimes to separate requests. Be
+You can set static or random thinktimes to separate requests. By
 default, a random thinktime will be a exponential distribution with
 mean equals to \varname{value}.
 
@@ -978,6 +1039,14 @@ statistics definition, conditional request (IF MODIFIED SINCE), ...
       </http>
    </request>
 \end{Verbatim}
+
+\strong{New in 1.3.O:} You can also read the content of a POST or PUT
+request from an external file:
+
+\begin{Verbatim}
+ <http url='mypage' method='POST' contents_from_file='/tmp/myfile' />
+\end{Verbatim}
+
 
 \subsubsection{Jabber/XMPP}
 
@@ -1141,6 +1210,53 @@ Example of directed presence (sent to random \userinput{online} users):
     </request>
     <thinktime value="5"></thinktime>
 \end{Verbatim}
+
+\paragraph{MUC}
+
+
+Tsung supports three MUC operations:
+\begin{enumerate}
+\item Join a room (attribute \userinput{type='muc:join'})
+\item Send a message to a room (attribute \userinput{type='muc:chat'})
+\item Change nickname (attribute \userinput{type='muc:nick'})
+\end{enumerate}
+
+Here's an example:
+\begin{Verbatim}
+<-- First, choose an random room and random nickname: -->
+<setdynvars sourcetype="random_number" start="1" end="100">
+ <var name="room"/>
+</setdynvars>
+<setdynvars sourcetype="random_string" length="10">
+ <var name="nick1"/>
+</setdynvars>
+
+<request subst="true">
+  <jabber type='muc:join' ack = "local" room = "room%%_room%%" nick = "%%_nick1%%"/>
+</request>
+
+<!-- use a for loop to send several messages to the room -->
+<for from="1" to="6" var="i">
+ <thinktime value="30"/>
+ <request subst="true">
+   <jabber type="muc:chat" ack="no_ack" size="16" room =
+   "room%%_room%%"/>
+ </request>
+</for>
+
+<!-- change nickname-->
+<thinktime value="2"/>
+<setdynvars sourcetype="random_string" length="10">
+ <var name="nick2"/>
+</setdynvars>
+
+<request subst="true">
+ <jabber type="muc:nick" room="room%%_room%%" nick="%%_nick2%%"
+         ack="no_ack"/>
+</request>
+\end{Verbatim}
+
+MUC support is available since version 1.3.1
 
 \paragraph{raw XML}
 You can send raw XML date to the server using the \varname{raw} type:
@@ -1586,21 +1702,32 @@ Five type of dynamic variables are currently implemented (\varname{sourcetype} t
 \end{Verbatim}
 \varname{delimiter} can be any string, and \varname{order} can be
 \userinput{iter} or \userinput{random}
-\item Dynamic variable can a random number
+\item Dynamic variable can be a random number
 \begin{Verbatim}
       <setdynvars sourcetype="random_number" start="3" end="32">
         <var name="rndint" />
       </setdynvars>
 \end{Verbatim}
-\item Dynamic variable can a random string
+\item Dynamic variable can be a random string
 \begin{Verbatim}
       <setdynvars sourcetype="random_string" length="13">
         <var name="rndstring1" />
       </setdynvars>
 \end{Verbatim}
-\item Dynamic variable can a urandom string: this is much faster than
+\item Dynamic variable can be a urandom string: this is much faster than
   the random string, but the string is not really random: the same set
-  of character is always used.
+  of characters is always used.
+\item Dynamic variable can be genarated by dynamic evaluation of
+  erlang code:
+\begin{Verbatim}
+      <setdynvars sourcetype="eval"
+                  code="fun({Pid,DynVars})->
+                           {ok,Val}=ts_dynvars:lookup(md5data,DynVars),
+                           ts_digest:md5hex(Val) end.">
+        <var name="md5sum" />
+      </setdynvars>
+\end{Verbatim}
+
 \end{enumerate}
 
 A \varname{setdynvars} can be defined anywhere in a session.
@@ -1631,7 +1758,8 @@ You can use a regexp instead of a simple string.
 
 The list of available actions to do is:
 \begin{itemize}
-\item continue
+\item continue: do nothing, continue (only update match or nomatch counters)
+\item log: log the request id, userid, sessionid in a file (in \file{match.log})
 \item abort : abort the session
 \item restart: restart the session. The maximum number of
   restarts is 3 by default.
@@ -1683,7 +1811,7 @@ The order is respected for paths without "descendant-or-self" axis, so this: \us
 
 Basic tests shows a x4 improvement in speed over the \emph{regexp} implementation.
 
-\subsubsection{Loops}
+\subsubsection{Loops, If}
 
 \strong{Since 1.3.0}, it's now possible to add conditional/unconditional loops in a session:
 
@@ -1734,6 +1862,19 @@ The last element of repeat must be either \userinput{<while>} or \userinput{<unt
 
   <until var="result" eq="5"/> </repeat>
 \end{Verbatim}
+
+\strong{Since 1.3.1}, it's also possible to add if statements based on
+dynamic variables:
+\paragraph{<if>}
+
+\begin{Verbatim}
+<if var="tsung_userid" eq="3">  
+  <request> <http url="/foo"/> </request>
+  <request> <http url="/bar"/> </request>
+</if>
+\end{Verbatim}
+
+You can use \varname{eq} or \varname{neq} to check the variable.
 
 \section{Statistics and reports}
 \label{sec:statistics-reports}
@@ -1854,6 +1995,18 @@ Figure \ref{fig:graph} show an example of a graphical report.
       \caption{Graphical output}
     \label{fig:graph}
 \end{figure}
+\subsection{Tsung Plotter}
+Tsung-Plotter (\command {tsplot} command) is an optional tool recently
+added in the Tsung distribution (it is written in Python), useful to
+compare different tests runned by Tsung. \command{tsplot} is able to
+plot data from several tsung.log files onto the same charts serie, for
+further comparison and analyze. You can easily customise the plots you
+want to generate. You can get more information in the manual page of
+the tool (man tsplot).
+
+Here's an example of the charts generated by tsplot:
+
+FIXME
 
 \section{References}
 
@@ -1880,6 +2033,92 @@ Web benchmarking workshop in April 2004 (more info at
 
 \section{Frequently Asked Questions}
 
+\subsection{Can't start distributed clients: timeout error }
+
+Most of the time, when a crash happened at startup without any traffic
+generated, the problem arise because the main Erlang controller node cannot
+create a "slave" Erlang virtual machine. The message looks like:
+
+\begin{Verbatim}
+Can't start newbeam on host 'XXXXX (reason: timeout) ! Aborting!
+\end{Verbatim}
+%%%$
+
+
+The problem is that the Erlang slave module cannot start a remote slave
+node.
+
+You can test this using this simple command on the controller node
+(remotehost is the name of the client node)
+\begin{Verbatim}
+>erl -rsh ssh -sname foo -setcookie mycookie
+
+Eshell V5.4.3 (abort with ^G)
+(foo@myhostname)1>slave:start(remotehost,bar,"-setcookie mycookie").
+\end{Verbatim}
+You should see this: \computeroutput{\{ok,bar@remotehost\}}
+
+If you got \computeroutput{\{error,timeout\}}, it can be caused by
+several problems:
+\begin{enumerate}
+\item ssh in not working (you must have a key without passphrase, or
+  use an agent)
+\item Tsung and Erlang are not installed on all clients nodes
+\item Erlang version or location (install path) is not the same on all clients nodes
+\item A firewall is dropping erlang packets: indeed erlang virtual machines use
+several tcp ports (dynamically generated) to communicate.
+\item SELinux: You should disable SELinux on all clients.
+\item Bad \file{/etc/hosts:}
+This one is wrong (real hostname should not refer to localhost/loopback):
+\begin{Verbatim}
+127.0.0.1 localhost myhostname
+\end{Verbatim}
+This one is good:
+\begin{Verbatim}
+127.0.0.1 localhost
+192.168.3.2 myhostname
+\end{Verbatim}
+\item sshd configuration:
+For example, for SuSE 9.2 sshd is compiled with restricted set of
+paths (\ie{} when you shell into the account you get the users shell,
+when you execute a command via ssh you don't) and this makes it
+impossible to start an erlang node (if erlang is installed in
+\file{/usr/local} for example).
+Run:
+
+\begin{Verbatim}
+ssh myhostname erl
+\end{Verbatim}
+
+If the erlang shell doesn't start then check what paths sshd was compiled with
+(in SuSE see \file{/etc/ssh/sshd_config}) and symlink from one of the approved paths
+to the erlang executable (thanks to Gordon Guthrie for reporting this).
+\end{enumerate}
+
+
+Note that you do not need to use the 127.0.0.1 address in the configuration file.
+It will not work if you use it as the injection interface. The shortname
+of your client machine should not refer to this address.
+
+\emph{Warn:}Tsung launches a new erlang virtual machine to do the actual injection
+even when you have only one machine in the injection cluster (unless
+\varname{'use\_controller\_vm'} is set to true). This is because it
+needs to by-pass some limit with the number of open socket from a
+single process (1024 most of the time). The idea is to have several
+system processes (Erl beam) that can handle only a small part of the
+network connection from the given computer. When the
+\varname{maxusers} limit (simultaneous) is reach, a new Erlang beam
+is launched and the newest connection can be handled by the new beam).
+
+\strong{New in 1.1.0}: If you don't use the distributed feature of
+Tsung and have trouble to start a remote beam on a local machine,
+you can set the \varname{'use\_controller\_vm'} attribute to true, for ex.:
+
+\begin{Verbatim}
+  <client host="mymachine" use_controller_vm="true">
+\end{Verbatim}
+
+
 \subsection{Tsung crashes when I start it }
 
 Does your Erlang system has ssl support enabled ?
@@ -1891,123 +2130,6 @@ to test it:
   1> ssl:start().
   you should see 'ok'
 \end{Verbatim}
-
-\subsection{Tsung still doesn't start ...}
-
-Most of the time, when a crash happened at startup without any traffic
-generated, the problem arise because the main Erlang controller node cannot
-create a "slave" Erlang virtual machine. The message looks like:
-
-\begin{Verbatim}
-===============================================
-=ERROR REPORT==== 4-May-2004::22:38:26 ===
-** Generic server ts_config_server terminating
-** Last message in was {'$gen_cast',{newbeam,myshortname,[]}}
-** When Server state == {state,{config,
-                                     undefined,
-                                     5,
-                                     full,
-                                     undefined,
-                                     [{client,
-                                          "myshortname",
-                                          2.00000,
-                                          5,
-                                          [{10,68,133,140}]}],
-                                     {server,"foo.net",80,gen_tcp},
-                                     [],
-                                     [{arrivalphase,
-                                          1,
-                                          60,
-                                          undefined,
-                                          undefined,
-                                          5.00000e-5,
-                                          infinity}],
-                                     undefined,
-                                     [{session,
-                                          1,
-                                          100,
-                                          ts_http,
-                                          parse,
-                                          true,
-                                          undefined}],
-                                     14,
-                                     3,
-                                     7,
-                                     6,
-                                     "negociate"},
-  "/home/username/.tsung/log/20040204-18:32",
-                               undefined,
-                               0,
-                               undefined,
-                               2.00000}
-** Reason for termination ==
-** {{badmatch,{error,timeout}},
-    [{ts_config_server,handle_cast,2},
-     {gen_server,handle_msg,6},
-     {proc_lib,init_p,5}]}
-\end{Verbatim}
-%%%$
-
-Tsung launches a new erl virtual machine to do the actual
-injection even when you have only one machine in the injection
-cluster. This is because it needs to by-pass some limit with the number
-of open socket from a single process (1024 most of the time). The idea
-is to have several system processes (Erl beam) that can handle only a
-small part of the network connection from the given computer. When the
-\varname{maxclient} limit (simultaneous) is reach, a new Erlang beam is launched
-and the newest connection can be handled by the new beam).
-
-The problem is that the Erlang slave module cannot start a local slave
-node. It tries to start it with the short node name
-\varname{"myshortname"} (\command{erl -sname myshortname}).
- If this fails the injection process cannot
-start. Most of the time, adding the short name with the correct IP
-address in the \file{/etc/hosts} file is sufficient to make it work.
-
-You can test this using these simple commands:
-\begin{Verbatim}
->erl -rsh ssh -sname foo -setcookie mycookie
-
-Eshell V5.4.3 (abort with ^G)
-(foo@myhostname)1>slave:start(remotehost,bar,"-setcookie mycookie").
-\end{Verbatim}
-You should see this: \computeroutput{\{ok,bar@remotehost\}}
-
-If you got \computeroutput{\{error,timeout\}}, it probably comes from
-a firewall dropping erlang packets; indeed erlang virtual machines use
-several tcp ports (dynamically generated) to communicate.
-The timeout can also comes from the use of SELinux. You should disable it.
-
-
-Note that you do not need to use the 127.0.0.1 address in the configuration file.
-It will not work if you use it as the injection interface. The shortname
-of your client machine should not refer to this address.
-
-\strong{New in 1.1.0}: If you don't use the distributed feature of
-Tsung and have trouble to start a remote beam on a local machine,
-you can set the \varname{'use\_controller\_vm'} attribute to true, for ex.:
-
-\begin{Verbatim}
-  <client host="mymachine" use_controller_vm="true">
-\end{Verbatim}
-
-You may also have problems due to the sshd configuration:
-
-For example, for SuSE 9.2 sshd is compiled with restricted set of
-paths (\ie{} when you shell into the account you get the users shell,
-when you execute a command via ssh you don't) and this makes it
-impossible to start an erlang node (if erlang is installed in
-\file{/usr/local} for example).
-
-Run:
-
-\begin{Verbatim}
-ssh myhostname erl
-\end{Verbatim}
-
-If the erlang shell doesn't start then check what paths sshd was compiled with
-(in SuSE see \file{/etc/ssh/sshd_config}) and symlink from one of the approved paths
-to the erlang executable (thanks to Gordon Guthrie for reporting this).
 
 \subsection{Why do i have error\_connect\_emfile errors ?}
 \label{sec:faq:emfile}
@@ -2045,7 +2167,7 @@ an erlang shell on the \varname{tsung\_controller} node. Use
 \command{toolbar:start().} to launch the graphical tools provided by
 Erlang.
 
-\subsection{Can i dynamically follow redirect with HTTP ?}
+\subsection{Can I dynamically follow redirect with HTTP ?}
 
 If your HTTP server sends 30X responses (redirect) with dynamic URLs,
 you can handle this situation using a dynamic variable:

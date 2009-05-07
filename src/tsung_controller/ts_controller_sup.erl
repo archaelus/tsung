@@ -61,8 +61,22 @@ init([LogDir]) ->
                  worker, [ts_mon]},
     Stats_Mon = {ts_stats_mon, {ts_stats_mon, start, []}, transient, 2000,
                  worker, [ts_stats_mon]},
-    Os_Mon = {ts_os_mon, {ts_os_mon, start, []}, transient, 2000,
-               worker, [ts_os_mon]},
+    Request_Mon = {request, {ts_stats_mon, start, [request]}, transient, 2000,
+                 worker, [ts_stats_mon]},
+    Page_Mon = {page, {ts_stats_mon, start, [page]}, transient, 2000,
+                 worker, [ts_stats_mon]},
+    Connect_Mon = {connect, {ts_stats_mon, start, [connect]}, transient, 2000,
+                 worker, [ts_stats_mon]},
+    Transaction_Mon = {transaction, {ts_stats_mon, start, [transaction]},
+                       transient, 2000, worker, [ts_stats_mon]},
+    Match_Log = {ts_match_logger, {ts_match_logger, start, [LogDir]}, transient, 2000,
+                 worker, [ts_match_logger]},
+    ErlangSup   = {ts_erlang_mon_sup, {ts_os_mon_sup, start_link, [erlang]},
+                    permanent, 2000, supervisor, [ts_os_mon_sup]},
+    MuninSup   = {ts_munin_mon_sup, {ts_os_mon_sup, start_link, [munin]},
+                    permanent, 2000, supervisor, [ts_os_mon_sup]},
+    SNMPSup   = {ts_snmp_mon_sup, {ts_os_mon_sup, start_link, [snmp]},
+                    permanent, 2000, supervisor, [ts_os_mon_sup]},
     Timer = {ts_timer, {ts_timer, start, [?config(nclients)]}, transient, 2000,
                worker, [ts_timer]},
     Msg  = {ts_msg_server, {ts_msg_server, start, []}, transient, 2000,
@@ -72,7 +86,8 @@ init([LogDir]) ->
                             ?config(nclients)]]},
             transient, 2000, worker, [ts_user_server]},
     {ok,{{one_for_one,?retries,10},
-         [Config, Mon, Stats_Mon, Timer, Msg, User, Os_Mon]}}.
+         [Config, Mon, Stats_Mon, Request_Mon, Page_Mon, Connect_Mon, Transaction_Mon,
+          Match_Log, Timer, Msg, User, ErlangSup, MuninSup,SNMPSup]}}.
 
 %%%----------------------------------------------------------------------
 %%% Internal functions

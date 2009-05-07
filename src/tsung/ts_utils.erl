@@ -39,9 +39,11 @@
          foreach_parallel/2, spawn_par/3, inet_setopts/3, resolve/2,
          stop_all/2, stop_all/3, stop_all/4, join/2, split2/2, split2/3,
          make_dir_rec/1, is_ip/1, from_https/1, to_https/1, keymax/2,
-         check_sum/3, check_sum/5, clean_str/1, file_to_list/1,
+         check_sum/3, check_sum/5, clean_str/1, file_to_list/1, term_to_list/1,
          decode_base64/1, encode_base64/1, to_lower/1, release_is_newer_or_eq/1,
-         randomstr/1,urandomstr/1,urandomstr_noflat/1]).
+         randomstr/1,urandomstr/1,urandomstr_noflat/1, eval/1, list_to_number/1,
+         time2sec/1
+        ]).
 
 level2int("debug")     -> ?DEB;
 level2int("info")      -> ?INFO;
@@ -79,11 +81,11 @@ get_val(Var) ->
 %% ensure atom to string conversion of environnement variable
 %% This is intended to fix a problem making tsung run under Windows
 %%  I convert parameter that are called from the command-line
-ensure_string(log_file, Atom) when atom(Atom) ->
+ensure_string(log_file, Atom) when is_atom(Atom) ->
     atom_to_list(Atom);
-ensure_string(proxy_log_file, Atom) when atom(Atom) ->
+ensure_string(proxy_log_file, Atom) when is_atom(Atom) ->
     atom_to_list(Atom);
-ensure_string(config_file, Atom) when atom(Atom) ->
+ensure_string(config_file, Atom) when is_atom(Atom) ->
     atom_to_list(Atom);
 ensure_string(_, Other) ->
     Other.
@@ -145,7 +147,9 @@ init_seed()->
 %% Purpose: returns unix like elapsed time in sec
 %%----------------------------------------------------------------------
 now_sec() ->
-    {MSec, Seconds, _} = now(),
+    time2sec(now()).
+
+time2sec({MSec, Seconds, _}) ->
     Seconds+1000000*MSec.
 
 %%----------------------------------------------------------------------
@@ -271,7 +275,10 @@ erl_system_args(extended)->
              end,
     Shared = SetArg(shared),
     Hybrid = SetArg(hybrid),
-    Smp = SetArg(smp),
+    case  ?config(smp_disable) of
+        true ->   Smp = " -smp disable ";
+        _    ->   Smp = SetArg(smp)
+    end,
     Inet = case init:get_argument(kernel) of
                {ok,[["inetrc",InetRcFile]]} ->
                    ?LOGF("Get inetrc= ~p~n",[InetRcFile],?NOTICE),
@@ -342,7 +349,7 @@ stop_all([Host],Name,MsgName)  ->
     VoidFun = fun(_A)-> ok end,
     stop_all([Host],Name,MsgName, VoidFun).
 
-stop_all([Host],Name,MsgName,Fun) when atom(Host) ->
+stop_all([Host],Name,MsgName,Fun) when is_atom(Host) ->
     _List= net_adm:world_list([Host]),
     global:sync(),
     case global:whereis_name(Name) of
@@ -361,7 +368,7 @@ stop_all(_,_,_,_)->
 %% make_dir_rec/1
 %% Purpose: create directory. Missing parent directories ARE created
 %%----------------------------------------------------------------------
-make_dir_rec(DirName) when list(DirName) ->
+make_dir_rec(DirName) when is_list(DirName) ->
     case  file:read_file_info(DirName) of
         {ok, #file_info{type=directory}} ->
             ok;
@@ -390,7 +397,7 @@ make_dir_rec(Path, [Parent|Childs]) ->
     end.
 
 %% check if a string is an IPv4 address (as "192.168.0.1")
-is_ip(String) when list(String) ->
+is_ip(String) when is_list(String) ->
     EightBit="(2[0-4][0-9]|25[0-5]|1[0-9][0-9]|[0-9][0-9]|[0-9])",
     RegExp = lists:append(["^",EightBit,"\.",EightBit,"\.",EightBit,"\.",EightBit,"$"]), %"
     case regexp:first_match(String, RegExp) of
@@ -426,7 +433,7 @@ from_https(String) when is_list(String)->
             update_content_length(NewString,Count+Location)
     end.
 
-%% @spec update_content_length(String) -> {ok, String}
+%% @spec update_content_length(string(), Count::integer()) -> {ok, String::string()}
 %% @doc since the length of URL is changed (https:// to http://ssl- )
 %% we must recalculate Content-Length if it is defined.
 update_content_length(String,0)     -> {ok, String } ;
@@ -608,9 +615,10 @@ resolve(Ip, Cache) ->
     end.
 
 %%----------------------------------------------------------------------
-%% @spec urandomstr_noflat/1
+%% @spec urandomstr_noflat(Size::integer()) ->string()
 %% @doc generate pseudo-random list of given size. Implemented by
 %% duplicating list of fixed size to be faster. unflatten version
+%% @end
 %%----------------------------------------------------------------------
 urandomstr_noflat(Size) when is_integer(Size) , Size >= ?DUPSTR_SIZE ->
     Msg= lists:duplicate(Size div ?DUPSTR_SIZE,?DUPSTR),
@@ -624,16 +632,51 @@ urandomstr_noflat(Size)  when is_integer(Size), Size >= 0 ->
     lists:nthtail(?DUPSTR_SIZE-Size, ?DUPSTR).
 
 %%----------------------------------------------------------------------
-%% @spec urandomstr/1
+%% @spec urandomstr(Size::integer()) ->string()
 %% @doc same as urandomstr_noflat/1, but returns a flat list.
+%% @end
 %%----------------------------------------------------------------------
 urandomstr(Size) when is_integer(Size), Size >= 0 ->
     lists:flatten(urandomstr_noflat(Size)).
 
 %%----------------------------------------------------------------------
-%% @spec randomstr/1
+%% @spec randomstr(Size::integer()) ->string()
 %% @doc returns a random string. slow if Size is high.
+%% @end
 %%----------------------------------------------------------------------
 randomstr(Size) when is_integer(Size), Size >= 0 ->
      lists:map(fun (_) -> random:uniform(25) + $a  end, lists:seq(1,Size)).
 
+
+%%----------------------------------------------------------------------
+%% @spec eval(string()) -> term()
+%% @doc evaluate strings as Erlang code at runtime
+%% @end
+%%----------------------------------------------------------------------
+eval(Code) ->
+    {ok, Scanned, _} = erl_scan:string(Code),
+    {ok, Parsed} = erl_parse:parse_exprs(Scanned),
+    {value, Result, _} = erl_eval:exprs(Parsed,  erl_eval:new_bindings()),
+    Result.
+
+%%----------------------------------------------------------------------
+%% @spec list_to_number(string()) -> integer() | float()
+%% @doc  convert a 'number' to either int or float
+%% @end
+%%----------------------------------------------------------------------
+list_to_number(Number) ->
+    try list_to_integer(Number) of
+        Int -> Int
+  catch
+      error:_Reason ->
+          list_to_float(Number)
+  end.
+
+term_to_list(I) when is_integer(I)->
+    integer_to_list(I);
+term_to_list(I) when is_atom(I)->
+    atom_to_list(I);
+term_to_list(I) when is_list(I)->
+    I;
+term_to_list(I) when is_float(I)->
+    float_to_list(I).

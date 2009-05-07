@@ -50,7 +50,8 @@
 -export([start_link/1, read_config/1, get_req/2, get_next_session/1,
          get_client_config/1, newbeam/1, newbeam/2, start_slave/4,
          get_monitor_hosts/0, encode_filename/1, decode_filename/1,
-         endlaunching/1, status/0, start_file_server/1, get_user_agents/0]).
+         endlaunching/1, status/0, start_file_server/1, get_user_agents/0,
+         get_client_config/2, get_user_param/1 ]).
 
 %%debug
 -export([choose_client_ip/1, choose_session/1]).
@@ -61,6 +62,10 @@
 
 -record(state, {config,
                 logdir,
+                client_static_users = 0, % number of clients that already have their static users
+                static_users = 0, % static users not yet given to a client
+                ports,            % dict, used if we need to choose the client port
+                users=1,          % userid (incremental counter)
                 start_date,       %
                 hostname,         % controller hostname
                 last_beam_id = 0, % last tsung beam id (used to set nodenames)
@@ -128,6 +133,9 @@ read_config(ConfigFile)->
 get_client_config(Host)->
     gen_server:call({global,?MODULE},{get_client_config, Host}, ?config_timeout).
 
+get_client_config(Type, Host)->
+    gen_server:call({global,?MODULE},{get_client_config, Type, Host}, ?config_timeout).
+
 %%--------------------------------------------------------------------
 %% Function: get_monitor_hosts/0
 %% Returns: [Hosts]
@@ -136,12 +144,16 @@ get_monitor_hosts()->
         gen_server:call({global,?MODULE},{get_monitor_hosts}).
 
 %%--------------------------------------------------------------------
-%% Function: get_next_session/0
-%% Description: choose randomly a session
-%% Returns: {ok, Session ID, Session Size (integer), IP (tuple)}
+%% @spec get_next_session(Host::string())-> {ok, SessionId::integer(),
+%%              SessionSize::integer(),IP::tuple(), UserId::integer()}
+%% @doc Choose randomly a session
+%% @end
 %%--------------------------------------------------------------------
 get_next_session(Host)->
     gen_server:call({global, ?MODULE},{get_next_session, Host}).
+
+get_user_param(Host)->
+    gen_server:call({global, ?MODULE},{get_user_param, Host}).
 
 endlaunching(Node) ->
     gen_server:cast({global, ?MODULE},{end_launching, Node}).
@@ -176,9 +188,9 @@ init([LogDir]) ->
 %%          {stop, Reason, Reply, State}   | (terminate/2 is called)
 %%          {stop, Reason, State}            (terminate/2 is called)
 %%--------------------------------------------------------------------
-handle_call({read_config, ConfigFile}, _From, State) ->
-    case catch ts_config:read(ConfigFile) of
-        {ok, Config=#config{session_tab=Tab,curid=LastReqId,sessions=[LastSess| _]}} ->
+handle_call({read_config, ConfigFile}, _From, State=#state{logdir=LogDir}) ->
+    case catch ts_config:read(ConfigFile, LogDir) of
+        {ok, Config=#config{curid=LastReqId,sessions=[LastSess| Sessions]}} ->
             case check_config(Config) of
                 ok ->
                     application:set_env(tsung_controller, clients, Config#config.clients),
@@ -190,11 +202,11 @@ handle_call({read_config, ConfigFile}, _From, State) ->
                     %% we only know now the size of last session from the file: add it
                     %% in the table
                     print_info(),
-                    ets:insert(Tab, {{LastSess#session.id, size}, LastReqId}),
+                    NewLast=LastSess#session{size = LastReqId},
                     %% start the file server (if defined) using a separate process (it can be long)
                     spawn(?MODULE, start_file_server, [Config#config.file_server]),
-                    NewConfig=loop_load(Config),
-                    {reply, ok, State#state{config=NewConfig, total_weight = Sum}};
+                    NewConfig=loop_load(sort_static(Config#config{sessions=[NewLast]++Sessions})),
+                    {reply, ok, State#state{config=NewConfig, static_users=NewConfig#config.static_users,total_weight = Sum}};
                 {error, Reason} ->
                     ?LOGF("Error while checking config: ~p~n",[Reason],?EMERG),
                     {reply, {error, Reason}, State}
@@ -234,40 +246,54 @@ handle_call({get_user_agents}, _From, State) ->
             {reply, UserAgents, State}
     end;
 
-%% get a new session id and an ip for the given node
-handle_call({get_next_session, HostName}, _From, State) ->
+%% get  user parameters (static user: the session id is already known)
+handle_call({get_user_param, HostName}, _From, State=#state{users=UserId,ports=Ports}) ->
     Config = State#state.config,
-    Tab    = Config#config.session_tab,
-
     {value, Client} = lists:keysearch(HostName, #client.host, Config#config.clients),
+    {IPParam, Server, NewPorts} = get_user_param(Client,Config,Ports),
+    ts_mon:newclient({static,now()}),
+    {reply, {ok, { IPParam, Server, UserId}}, State#state{users=UserId+1,ports=NewPorts}};
 
-    {ok,IP} = choose_client_ip(Client),
-    {ok, Server} = choose_server(Config#config.servers),
-
+%% get a new session id and user parameters for the given node
+handle_call({get_next_session, HostName}, _From, State=#state{users=Users,ports=Ports}) ->
+    Config = State#state.config,
+    {value, Client} = lists:keysearch(HostName, #client.host, Config#config.clients),
     ?DebugF("get new session for ~p~n",[_From]),
     case choose_session(Config#config.sessions) of
         {ok, Session=#session{id=Id}} ->
             ?LOGF("Session ~p choosen~n",[Id],?INFO),
-            case ets:lookup(Tab, {Id, size}) of
-                [{_, Size}] ->
-                    {reply, {ok, {Session, Size, IP, Server}}, State};
-                Other ->
-                    {reply, {error, Other}, State}
-            end;
+            ts_mon:newclient({Id,now()}),
+            {IPParam, Server, NewPorts} = get_user_param(Client,Config,Ports),
+            {reply, {ok, {Session, IPParam, Server, Users}},
+             State#state{users=Users+1,ports=NewPorts}};
         Other ->
             {reply, {error, Other}, State}
     end;
 
-%%
+handle_call({get_client_config, static, Host}, _From, State=#state{config=Config}) ->
+%% static users (eg. each user started once at fixed time)
+%% we must spread this list of fixed users to each beam
+%% If we have N users and M client beams
+    Clients=Config#config.clients,
+    StaticUsers=State#state.static_users,
+    Done=State#state.client_static_users, % number of clients that already have their static users
+    {value, Client} = lists:keysearch(Host, #client.host, Clients),
+    StartDate = set_start_date(State#state.start_date),
+    case Done == length(Clients)+1 of
+        true -> % last client, give him all pending users
+            {reply,{ok,StaticUsers,StartDate},State#state{start_date=StartDate,static_users=[]}};
+        false ->
+            Weight = Client#client.weight,
+            Number=round(length(StaticUsers)*Weight/State#state.total_weight),
+            {NewUsers,Tail}=lists:split(Number,StaticUsers),
+            {reply,{ok,NewUsers,StartDate},State#state{start_date=StartDate,static_users=Tail}}
+    end;
+%% get randomly generated users
 handle_call({get_client_config, Host}, _From, State) ->
     ?DebugF("get_client_config from ~p~n",[Host]),
     Config = State#state.config,
     %% set start date if not done yet
-    StartDate = case State#state.start_date of
-                    undefined ->
-                        ts_utils:add_time(now(), ?config(warm_time));
-                    Date -> Date
-                end,
+    StartDate = set_start_date(State#state.start_date),
     case get_client_cfg(Config#config.arrivalphases,
                         Config#config.clients, State#state.total_weight,
                         Host) of
@@ -301,8 +327,8 @@ handle_call(Request, _From, State) ->
 %%--------------------------------------------------------------------
 %% start the launcher on the current beam
 handle_cast({newbeam, Host, []}, State=#state{last_beam_id = NodeId,
-                                              hostname=LocalHost,
-                                              config = Config})
+                                              hostname = LocalHost,
+                                              config   = Config})
   when Config#config.use_controller_vm and ( ( LocalHost == Host ) or ( Host == 'localhost' )) ->
     ?LOGF("Start a launcher on the controller beam ~p~n", [LocalHost], ?NOTICE),
     LogDir = encode_filename(State#state.logdir),
@@ -322,6 +348,7 @@ handle_cast({newbeam, Host, []}, State=#state{last_beam_id = NodeId,
         ok ->
             ?LOG("Application started, activate launcher, ~n", ?INFO),
             application:set_env(tsung, debug_level, Config#config.loglevel),
+            ts_launcher_static:launch({node(), Host, []}),
             ts_launcher:launch({node(), Host, []}),
             {noreply, State#state{last_beam_id = NodeId +1}};
         {error, Reason} ->
@@ -333,14 +360,14 @@ handle_cast({newbeam, Host, []}, State=#state{last_beam_id = NodeId,
 %% use_controller_vm and max number of concurrent users reached , big trouble !
 handle_cast({newbeam, Host, _}, State=#state{ hostname=LocalHost,config=Config})
   when Config#config.use_controller_vm and ( ( LocalHost == Host ) or ( Host == 'localhost' )) ->
-    Msg ="Maximum number of concurrent users in a single VM reached and 'use_controller_vm' is true, can't start new beam !!!~n",
+    Msg ="Maximum number of concurrent users in a single VM reached and 'use_controller_vm' is true, can't start new beam !!! Check 'maxusers' value in <client> configuration.~n",
     ?LOG(Msg, ?EMERG),
     erlang:display(Msg),
     {noreply, State};
 
 %% start a launcher on a new beam with slave module
 handle_cast({newbeam, Host, Arrivals}, State=#state{last_beam_id = NodeId}) ->
-    Name = "tsung" ++ integer_to_list(NodeId),
+    Name = set_nodename(NodeId),
     {ok, [[BootController]]}    = init:get_argument(boot),
     ?DebugF("BootController ~p~n", [BootController]),
     {ok, [[?TSUNGPATH,PathVar]]}    = init:get_argument(boot_var),
@@ -408,6 +435,16 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%--------------------------------------------------------------------
 
+set_start_date(undefined)->
+     ts_utils:add_time(now(), ?config(warm_time));
+set_start_date(Date) -> Date.
+
+get_user_param(Client,Config,Ports)->
+    {ok,IP} = choose_client_ip(Client),
+    {ok, Server} = choose_server(Config#config.servers),
+    {NewPorts,CPort}   = choose_port(IP, Ports,Config#config.ports_range),
+    { {IP, CPort}, Server, NewPorts}.
+
 %%----------------------------------------------------------------------
 %% Func: choose_client_ip/1
 %% Args: #client, Dict
@@ -469,7 +506,8 @@ choose_session([#session{popularity=P} | SList], Rand, Cur) ->
 %% Func: get_client_cfg/4
 %% Args: list of #arrivalphase, list of #client, String
 %% Purpose: set parameters for given host client
-%% Returns: {ok, {Intensity = float, Users=integer, StartDate = tuple}}
+%% Returns: {ok, {Intensity = float, Users=integer, StartDate = tuple,
+%%                Max = MaxNumber of clients to start}}
 %%          | {error, Reason}
 %%----------------------------------------------------------------------
 get_client_cfg(Arrival, Clients, TotalWeight, Host) ->
@@ -477,6 +515,7 @@ get_client_cfg(Arrival, Clients, TotalWeight, Host) ->
     get_client_cfg(SortedPhases, Clients, TotalWeight,Host, []).
 
 %% get_client_cfg/5
+%% all phases scanned, look for max and return config.
 get_client_cfg([], Clients, _TotalWeight, Host, Cur) ->
     {value, Client} = lists:keysearch(Host, #client.host, Clients),
     Max = Client#client.maxusers,
@@ -492,7 +531,8 @@ get_client_cfg([Arrival=#arrivalphase{duration = Duration,
                  infinity -> %% only use the duration to set the number of users
                      Duration * 1000 * ClientIntensity;
                  _ ->
-                     lists:min([MaxNumber, Duration*1000*ClientIntensity])
+                     ClientMaxNumber = trunc(MaxNumber * Weight / TotalWeight),
+                     lists:min([ClientMaxNumber, Duration*1000*ClientIntensity])
              end,
     %% TODO: store the max number of clients
     ?LOGF("New arrival phase ~p for client ~p: will start ~p users~n",
@@ -557,7 +597,7 @@ check_config(Config)->
     end.
 
 
-load_app(Name) when atom(Name) ->
+load_app(Name) when is_atom(Name) ->
     FName = atom_to_list(Name) ++ ".app",
     case code:where_is_file(FName) of
     non_existing ->
@@ -591,6 +631,12 @@ loop_load(Config=#config{load_loop=Loop, arrivalphases=Arrival},Max,Current) ->
     NewArrival = lists:keymap(Fun,#arrivalphase.phase,Arrival),
     loop_load(Config#config{load_loop=Loop-1},Max,lists:append(Current, NewArrival)).
 
+%% @doc sort static users by start time
+sort_static(Config=#config{static_users=S})->
+    ?LOGF("sort static users: ~p ~n", [S], ?DEB),
+    SortedL= lists:keysort(1,S),
+    Config#config{static_users=static_name_to_session(Config#config.sessions,SortedL)}.
+
 %%
 %% @doc start a remote beam
 %%
@@ -600,8 +646,51 @@ start_slave(Host, Name, Args, Arrivals)->
             ?LOGF("started newbeam on node ~p ~n", [Node], ?NOTICE),
             Res = net_adm:ping(Node),
             ?LOGF("ping ~p ~p~n", [Node,Res], ?NOTICE),
+            case Arrivals of
+                [] -> ts_launcher_static:launch({Node,[]});
+                _  -> ok  %no static launcher needed in this case
+            end,
             ts_launcher:launch({Node, Arrivals});
         {error, Reason} ->
             ?LOGF("Can't start newbeam on host ~p (reason: ~p) ! Aborting!~n",[Host, Reason],?EMERG),
             exit({slave_failure, Reason})
     end.
+
+choose_port(_,_, undefined) ->
+    {[],0};
+choose_port(Client,undefined, Range) ->
+    choose_port(Client,dict:new(), Range);
+choose_port(ClientIp,Ports, {Min, Max}) ->
+    case dict:find(ClientIp,Ports) of
+        {ok, Val} when Val =< Max ->
+            NewPorts=dict:update_counter(ClientIp,1,Ports),
+            {NewPorts,Val};
+        _ -> % Max Reached or new entry
+            NewPorts=dict:store(ClientIp,Min+1,Ports),
+            {NewPorts,Min}
+    end.
+
+%% @spec session_name_to_session(Sessions::list(), Static::list() ) -> StaticUsers::list()
+%% @doc convert session name to session id in static users list
+static_name_to_session(Sessions, Static) ->
+    ?LOGF("Static users with session id ~p~n",[Static],?DEB),
+    Search = fun({Delay,Name})->
+                     {value, Session} = lists:keysearch(Name, #session.name, Sessions),
+                     {Delay, Session}
+             end,
+    Res=lists:map(Search, Static),
+    ?LOGF("Static users with session id ~p~n",[Res],?DEB),
+    Res.
+
+%% @spec set_nodename(NodeId::integer()) -> string()
+%% @doc set slave node name: check if controller node name has an id,
+%%      and put it in the slave name
+set_nodename(NodeId) when is_integer(NodeId)->
+    CId = case atom_to_list(node()) of
+              "tsung_controller@"++_ ->
+                  "";
+              "tsung_controller"++Tail ->
+                  [Id|_] = string:tokens(Tail,"@"),
+                  Id++"_"
+          end,
+    "tsung"++ CId++ integer_to_list(NodeId).

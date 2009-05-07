@@ -25,15 +25,18 @@
 -author('nicolas.niclausse@niclux.org').
 
 -record(dyndata,
-        {dynvars, % dynamic variables
-         proto    % dynamic data specific to protocole (#http_dyndata for HTTP)
+        {dynvars = [], % dynamic variables
+         proto         % dynamic data specific to protocol (#http_dyndata for HTTP)
        }).
 
 -record(match,
         { regexp,
+          subst = false,
          'when' = false,
-          do    = continue, %(continue | loop | stop)
-          sleep_loop, % in seconds
+          do    = continue, %(continue | loop | abort | log )
+          sleep_loop,       % in seconds
+          apply_to_content,
+          skip_headers = no,
           max_loop,
           loop_back,
           max_restart
@@ -44,7 +47,7 @@
          ack,
          subst=false,
          match=[],
-         dynvar_specs=undefined, % undefined | [{VarName, Regexp} |...]
+         dynvar_specs=[], % [] | [{VarName, Regexp} |...]
          param,
          endpage=false,
          host,       % override global server hostname
@@ -54,43 +57,46 @@
 
 % protocol options
 -record(proto_opts,
-        {ssl_ciphers = negociate, % for ssl only
-         retry_timeout = 10, % retry sending in microsec
-         idle_timeout = 600000,
-         tcp_rcv_size = 32768, % tcp buffers size
-         tcp_snd_size = 32768,
-         udp_rcv_size, % udp buffers size
+        {ssl_ciphers   = negociate, % for ssl only
+         retry_timeout = 10,        % retry sending in microsec
+         idle_timeout  = 600000,
+         tcp_rcv_size  = 32768,     % tcp buffers size
+         tcp_snd_size  = 32768,
+         udp_rcv_size,              % udp buffers size
          udp_snd_size}).
 
--define(size_mon_thresh, 524288). % 512KB
+-define(size_mon_thresh, 524288).   % 512KB
 
 % state of ts_client gen_server
 -record(state_rcv,
         {socket=none, %
          ip,          % local ip to bind to
          timeout,     % ?
+         retries=0,   % number of connect retries
+         hibernate = 10000, % hibernate if thinktime is >= to this (10sec by default)
          host,        % hostname (or IP) of remote server
          port,        % server port
          protocol,    % gen_udp, gen_tcp or ssl
          proto_opts = #proto_opts{},  %
          bidi = false,% true if bidirectional protocol
 
-         profile,     % session id
+         session_id,
          request,     % current request specs
          persistent,  % if true, don't exit when connexion is closed
          timestamp,   % previous message date
          starttime,   % date of the beginning of the session
          count,       % number of requests waiting to be sent
-         maxcount,       % number of requests waiting to be sent
-         ack_done=false, % 'true' if the ack was sent, else 'false' (unused if ack=no_ack)
+         maxcount,        % number of requests waiting to be sent
+         ack_done=false,  % 'true' if the ack was sent, else 'false' (unused if ack=no_ack)
          send_timestamp,  % date when the 'request' was sent
-         page_timestamp=0,  % date when the first 'request' of a page was sent
+         page_timestamp=0,% date when the first 'request' of a page was sent
          acc=[],     % Accumulator to store temporary unparsable data
                      % (Waiting for more data)
          buffer = <<>>, % buffer when we have to keep the response (we need
                      % all the response to do pattern matching)
          session,    % record of session status; depends on 'clienttype'
          datasize=0,
+         id,         % user id
          size_mon_thresh=?size_mon_thresh, % if rcv data is > to this, update stats
          dyndata=[], % persistent data dynamically added during the
                      % session (Cookies for examples)

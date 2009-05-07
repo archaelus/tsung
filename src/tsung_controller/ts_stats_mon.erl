@@ -39,7 +39,10 @@
 -include("ts_config.hrl").
 
 %% External exports, API
--export([start/0, stop/0, add/1, dumpstats/0, set_output/2, status/0 ]).
+-export([start/0, start/1, stop/0, stop/1,
+         add/1, add/2, dumpstats/0, dumpstats/1,
+         set_output/2, set_output/3,
+         status/1, status/2 ]).
 
 %% More external exports for ts_mon
 -export([print_stats_txt/3, update_stats/3, add_stats_data/2, reset_all_stats/1]).
@@ -51,6 +54,7 @@
 -record(state, {log,          % log fd
                 backend,      % type of backend: text|rrdtool|fullstats
                 dump_interval,%
+                type = ts_stats_mon, % type of stats
                 fullstats,    % fullstats filename
                 stats,        % dict keeping stats info
                 laststats     % values of last printed stats
@@ -61,27 +65,46 @@
 %%%----------------------------------------------------------------------
 
 %%----------------------------------------------------------------------
-%% @spec start() -> ok | throw({error, Reason})
+%% @spec start(Id::term()) -> ok | throw({error, Reason})
 %% @doc Start the monitoring process
 %%----------------------------------------------------------------------
+start(Id) ->
+    ?LOGF("starting ~p stats server, global ~n",[Id],?NOTICE),
+    gen_server:start_link({global, Id}, ?MODULE, [Id], []).
+
 start() ->
     ?LOG("starting stats server, global ~n",?NOTICE),
-    gen_server:start_link({global, ?MODULE}, ?MODULE, [], []).
+    gen_server:start_link({global, ?MODULE}, ?MODULE, [?MODULE], []).
+
+stop(Id) ->
+    gen_server:cast({global, Id}, {stop}).
 
 stop() ->
     gen_server:cast({global, ?MODULE}, {stop}).
 
+add([]) -> ok;
 add(Data) ->
     gen_server:cast({global, ?MODULE}, {add, Data}).
 
-status() ->
-    gen_server:call({global, ?MODULE}, {status}).
+add([], _Id) -> ok;
+add(Data, Id) ->
+    gen_server:cast({global, Id}, {add, Data}).
+
+status(Name,Type) ->
+    gen_server:call({global, ?MODULE}, {status, Name, Type}).
+status(Id) ->
+    gen_server:call({global, Id}, {status}).
 
 dumpstats() ->
     gen_server:cast({global, ?MODULE}, {dumpstats}).
+dumpstats(Id) ->
+    gen_server:cast({global, Id}, {dumpstats}).
 
 set_output(BackEnd,Stream) ->
-    gen_server:cast({global, ?MODULE}, {set_output, BackEnd, Stream}).
+    set_output(BackEnd,Stream,?MODULE).
+
+set_output(BackEnd,Stream,Id) ->
+    gen_server:cast({global, Id}, {set_output, BackEnd, Stream}).
 
 %%%----------------------------------------------------------------------
 %%% Callback functions from gen_server
@@ -94,11 +117,22 @@ set_output(BackEnd,Stream) ->
 %%          ignore               |
 %%          {stop, Reason}
 %%----------------------------------------------------------------------
-init([]) ->
-    ?LOG("starting stats server~n",?NOTICE),
+%% single type of data: don't need a dict, a simple list can store the data
+init([Type]) when Type == 'connect'; Type == 'page'; Type == 'request' ->
+    ?LOGF("starting dedicated stats server for ~p ~n",[Type],?NOTICE),
+    Stats = [0,0,0,0,0,0,0,0],
+    {ok, #state{ dump_interval = ?config(dumpstats_interval),
+                 stats     = Stats,
+                 type      = Type,
+                 laststats = Stats
+                }};
+%% id = transaction or ?MODULE: it can handle several types of stats, must use a dict.
+init([Id]) ->
+    ?LOGF("starting ~p stats server~n",[Id],?NOTICE),
     Tab = dict:new(),
     {ok, #state{ dump_interval = ?config(dumpstats_interval),
                  stats   = Tab,
+                 type    = Id,
                  laststats = Tab
                 }}.
 
@@ -111,9 +145,14 @@ init([]) ->
 %%          {stop, Reason, Reply, State}   | (terminate/2 is called)
 %%          {stop, Reason, State}            (terminate/2 is called)
 %%----------------------------------------------------------------------
-handle_call({status}, _From, State ) ->
-    Request = dict:find({request, sample}, State#state.stats),
-    {reply, Request, State};
+handle_call({status}, _From, State=#state{stats=Stats} ) when is_list(Stats) ->
+    [_Esp, _Var, _Max, _Min, Count, _MeanFB,_CountFB,_Last] = Stats,
+    {reply, Count, State};
+handle_call({status}, _From, State=#state{stats=Stats} ) ->
+    {reply, Stats, State};
+handle_call({status, Name, Type}, _From, State ) ->
+    Value = dict:find({Name,Type}, State#state.stats),
+    {reply, Value, State};
 
 handle_call(Request, _From, State) ->
     ?LOGF("Unknown call ~p !~n",[Request],?ERR),
@@ -126,6 +165,17 @@ handle_call(Request, _From, State) ->
 %%          {noreply, State, Timeout} |
 %%          {stop, Reason, State}            (terminate/2 is called)
 %%----------------------------------------------------------------------
+handle_cast({add, Data}, State=#state{type=Type}) when (( Type == 'connect') or
+                                                         (Type == 'page') or
+                                                         (Type == 'request'))  ->
+    case State#state.backend of
+        fullstats -> io:format(State#state.fullstats,"~p~n",[{sample, Type, Data}]);
+        _Other   -> ok
+    end,
+    [Esp, Var, Max, Min, I, MeanFB,CountFB,Last] = State#state.stats,
+    {NewEsp,NewVar,NewMin,NewMax,NewI} = ts_stats:meanvar_minmax(Esp,Var,Min,Max,Data,I),
+    {noreply,State#state{stats=[NewEsp,NewVar,NewMax,NewMin,NewI,MeanFB,CountFB,Last]}};
+
 handle_cast({add, Data}, State) when is_list(Data) ->
     case State#state.backend of
         fullstats -> io:format(State#state.fullstats,"~p~n",[Data]);
@@ -194,7 +244,7 @@ code_change(_OldVsn, StateData, _Extra) ->
 %% Returns: Dict
 %%----------------------------------------------------------------------
 %% continuous incrementing counters
-add_stats_data({Type, Name,Value},Stats) when Type==sample;
+add_stats_data({Type, Name, Value},Stats) when Type==sample;
                                               Type==sample_counter ->
     MyFun = fun (OldVal) -> update_stats(Type, OldVal, Value) end,
     dict:update({Name,Type}, MyFun, update_stats(Type, [], Value), Stats);
@@ -208,8 +258,10 @@ add_stats_data({sum, Name, Val}, Stats)  ->
 %%----------------------------------------------------------------------
 %% Func: export_stats/2
 %%----------------------------------------------------------------------
+export_stats(State=#state{type=Type}) when Type == 'connect'; Type == 'page'; Type == 'request' ->
+    Param = {State#state.laststats,State#state.log},
+    print_stats_txt({Type,sample}, State#state.stats, Param);
 export_stats(State=#state{backend=_Backend}) ->
-    %% print number of simultaneous users
     Param = {State#state.laststats,State#state.log},
     dict:fold(fun print_stats_txt/3, Param, State#state.stats).
 
@@ -218,6 +270,10 @@ export_stats(State=#state{backend=_Backend}) ->
 %% @spec (Key::tuple(), Value::List, {Last, Logfile}) -> {Last, Logfile}
 %% @doc print statistics in text format in Logfile
 %%----------------------------------------------------------------------
+print_stats_txt({_Name,_Type}, [], {LastRes,Logfile})->
+    {LastRes, Logfile};
+print_stats_txt({_Name,_Type}, [0,0,0,0,0,0,0|_], {LastRes,Logfile})->
+    {LastRes,Logfile};
 print_stats_txt({Name,_Type}, [Mean,0,Max,Min,Count,MeanFB,CountFB|_], {LastRes,Logfile})->
     io:format(Logfile, "stats: ~p ~p ~p ~p ~p ~p ~p ~p~n",
               [Name, Count, Mean, 0, Max, Min,MeanFB,CountFB ]),
@@ -229,6 +285,11 @@ print_stats_txt({Name,_Type},[Mean,Var,Max,Min,Count,MeanFB,CountFB|_],{LastRes,
     {LastRes, Logfile};
 print_stats_txt({Name, _Type}, [Value,Last], {LastRes, Logfile}) ->
     io:format(Logfile, "stats: ~p ~p ~p~n", [Name, Value, Last ]),
+    {LastRes, Logfile};
+print_stats_txt({_Name, _Type}, 0, {0, Logfile})-> % no data yet
+    {0, Logfile};
+print_stats_txt({Name, _Type}, Value, {LastRes, Logfile}) when is_number(LastRes)->
+    io:format(Logfile, "stats: ~p ~p ~p~n", [Name, Value-LastRes, Value]),
     {LastRes, Logfile};
 print_stats_txt({Name, Type}, Value, {LastRes, Logfile}) ->
     PrevVal = case dict:find({Name, Type}, LastRes) of
@@ -245,63 +306,59 @@ print_stats_txt({Name, Type}, Value, {LastRes, Logfile}) ->
 %% @doc update the mean and variance for the given sample
 %%----------------------------------------------------------------------
 update_stats(sample, [], New) ->
-    [New, 0, New, New, 1,0,0];
-update_stats(sample, [Mean, Var, Max, Min, Count,MeanFB,CountFB], Value) ->
-    {NewMean, NewVar, _} = ts_stats:meanvar(Mean, Var, [Value], Count),
-    case Value > Max of
-        true -> % new max, min unchanged
-            [NewMean, NewVar, Value, Min, Count+1,MeanFB,CountFB];
-        false ->
-            case Value < Min of
-                true ->
-                    [NewMean, NewVar, Max, Value, Count+1,MeanFB,CountFB];
-                false ->
-                    [NewMean, NewVar, Max, Min, Count+1,MeanFB,CountFB]
-            end
-    end;
+    [New, 0, New, New, 1, 0, 0, 0];
+update_stats(sample, Data, Value) ->
+    %% we don't use lastvalue for 'sample', set it to zero
+    update_stats2(Data, Value, 0);
 update_stats(sample_counter,[], New) -> %% first call, store the initial value
-    [0, 0, 0, 0, 0, 0,0,New];
+    [0, 0, 0, 0, 0, 0, 0, New];
+update_stats(sample_counter, Current, 0) -> % skip 0 values
+    Current;
+update_stats(sample_counter,[Mean,Var,Max,Min,Count,MeanFB,CountFB,Last],Value)
+  when Value < Last->
+    %% maybe the counter has been restarted, use the new value, but don't update other data
+    [Mean,Var,Max,Min,Count,MeanFB,CountFB,Value];
 update_stats(sample_counter, [0, 0, 0, 0, 0, MeanFB,CountFB,Last], Value) ->
     New = Value-Last,
     [New, 0, New, New, 1, MeanFB,CountFB,Value];
-update_stats(sample_counter,[Mean, Var, Max, Min, Count, MeanFB,CountFB,Last], Value) ->
+update_stats(sample_counter,Data, Value) ->
+    update_stats2(Data, Value, Value).
+
+update_stats2([Mean, Var, Max, Min, Count, MeanFB,CountFB,Last], Value, NewLast) when is_number(Value), is_number(NewLast), is_number(Last), is_number(Count)->
     New = Value-Last,
     {NewMean, NewVar, _} = ts_stats:meanvar(Mean, Var, [New], Count),
-    case New > Max of
-        true -> % new max, min unchanged
-            [NewMean, NewVar, New, Min, Count+1, MeanFB,CountFB,Value];
-        false ->
-            case Value < Min of
-                true ->
-                    [NewMean, NewVar, Max, New, Count+1, MeanFB,CountFB,Value];
-                false ->
-                    [NewMean, NewVar, Max, Min, Count+1, MeanFB,CountFB,Value]
-            end
+    if
+        New > Max -> % new max, min unchanged
+            [NewMean, NewVar, New, Min, Count+1, MeanFB,CountFB,NewLast];
+        New < Min ->
+            [NewMean, NewVar, Max, New, Count+1, MeanFB,CountFB,NewLast];
+        true ->
+            [NewMean, NewVar, Max, Min, Count+1, MeanFB,CountFB,NewLast]
     end.
 
 %%----------------------------------------------------------------------
 %% Func: reset_all_stats/1
 %%----------------------------------------------------------------------
+reset_all_stats(Data) when is_list(Data)->
+    reset_stats(Data);
 reset_all_stats(Dict)->
     MyFun = fun (_Key, OldVal) -> reset_stats(OldVal) end,
     dict:map(MyFun, Dict).
 
 %%----------------------------------------------------------------------
-%% Func: reset_stats/1
-%% @doc reset all stats except min and max and lastvalue.
+%% @spec reset_stats(list()) -> list()
+%% @doc reset all stats except min and max and lastvalue. Compute the
+%%      global mean here
+%% @end
 %%----------------------------------------------------------------------
-reset_stats([]) ->  % FIXME: useful ?!
-    [0, 0, 0, 0, 0, 0, 0];
+reset_stats([]) ->
+    [];
 reset_stats([_Mean, _Var, Max, Min, 0, _MeanFB,0,Last]) ->
     [0, 0, Max, Min, 0, 0, 0,Last];
 reset_stats([Mean, _Var, Max, Min, Count, MeanFB,CountFB,Last]) ->
     NewCount=CountFB+Count,
     NewMean=(CountFB*MeanFB+Count*Mean)/NewCount,
     [0, 0, Max, Min, 0, NewMean,NewCount,Last];
-reset_stats([Mean, _Var, Max, Min, Count,MeanFB,CountFB]) ->
-    NewCount=CountFB+Count,
-    NewMean=(CountFB*MeanFB+Count*Mean)/NewCount,
-    [0, 0, Max, Min, 0,NewMean,NewCount];
 reset_stats([_Sample, LastValue]) ->
     [0, LastValue];
 reset_stats(LastValue) ->

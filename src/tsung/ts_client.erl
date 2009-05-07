@@ -37,6 +37,9 @@
 -include("ts_profile.hrl").
 -include("ts_config.hrl").
 
+-define(MAX_RETRIES,3). % max number of connection retries
+-define(RETRY_TIMEOUT,10000). % waiting time between retries (msec)
+
 %% External exports
 -export([start/1, next/1]).
 
@@ -49,14 +52,17 @@
 %%% API
 %%%----------------------------------------------------------------------
 
-%% Start a new session
+%% @spec start(Opts::{Session::#session{},IP::tuple(),Server::#server{},
+%%       Id::integer()}) -> {ok, Pid::pid()} | ignore | {error, Error::term()}
+%% @doc Start a new session
 start(Opts) ->
     ?DebugF("Starting with opts: ~p~n",[Opts]),
     gen_fsm:start_link(?MODULE, Opts, []).
 
 %%----------------------------------------------------------------------
-%% Func: next/1
-%% Purpose: continue with the next request (used for global ack)
+%% @spec next({pid()}) -> ok
+%% @doc Purpose: continue with the next request (used for global ack)
+%% @end
 %%----------------------------------------------------------------------
 next({Pid}) ->
     gen_fsm:send_event(Pid, next_msg).
@@ -72,22 +78,26 @@ next({Pid}) ->
 %%          ignore               |
 %%          {stop, Reason}
 %%----------------------------------------------------------------------
-init({#session{id           = Profile,
+init({#session{id           = SessionId,
                persistent   = Persistent,
                bidi         = Bidi,
+               hibernate    = Hibernate,
                proto_opts   = ProtoOpts,
-               type         = CType}, Count, IP, Server}) ->
+               size         = Count,
+               type         = CType}, IP, Server,Id}) ->
     ?DebugF("Init ... started with count = ~p~n",[Count]),
     ts_utils:init_seed(),
 
     ?DebugF("Get dynparams for ~p~n",[CType]),
     DynData = CType:init_dynparams(),
+    NewDynVars = ts_dynvars:set(tsung_userid,integer_to_list(Id),
+                                DynData#dyndata.dynvars),
+    NewDynData = DynData#dyndata{dynvars=NewDynVars},
     StartTime= now(),
-    ts_mon:newclient({self(), StartTime}),
     set_thinktime(?short_timeout),
     {ok, think, #state_rcv{ port       = Server#server.port,
                             host       = Server#server.host,
-                            profile    = Profile,
+                            session_id = SessionId,
                             bidi       = Bidi,
                             protocol   = Server#server.type,
                             clienttype = CType,
@@ -98,8 +108,10 @@ init({#session{id           = Profile,
                             proto_opts = ProtoOpts,
                             count      = Count,
                             ip         = IP,
+                            id         = Id,
+                            hibernate  = Hibernate,
                             maxcount   = Count,
-                            dyndata    = DynData
+                            dyndata    = NewDynData
                            }}.
 
 %%--------------------------------------------------------------------
@@ -114,7 +126,11 @@ wait_ack(next_msg,State=#state_rcv{request=R}) when R#ts_request.ack==global->
                                       [{active, once} ]),
     {PageTimeStamp, _} = update_stats(State),
     handle_next_action(State#state_rcv{socket=NewSocket,
-                                       page_timestamp=PageTimeStamp}).
+                                       page_timestamp=PageTimeStamp});
+wait_ack(timeout,State) ->
+    ?LOG("Error: timeout receive in state wait_ack~n", ?ERR),
+    ts_mon:add({ count, timeout }),
+    {stop, normal, State}.
 
 %%--------------------------------------------------------------------
 %% Func: handle_event/3
@@ -257,6 +273,9 @@ handle_info({NetEvent, _Socket, Data}, think, State)
     ?LOG("Data receive from socket in state think, stop~n", ?ERR),
     ?DebugF("Data was ~p~n",[Data]),
     {stop, normal, State};
+handle_info({inet_reply, _Socket,ok}, StateName, State ) ->
+    ?LOGF("inet_reply ok received in state ~p~n",[StateName],?NOTICE),
+    {next_state, StateName, State};
 handle_info(Msg, StateName, State ) ->
     ?LOGF("Error: Unknown msg ~p receive in state ~p, stop~n", [Msg,StateName], ?ERR),
     ts_mon:add({ count, error_unknown_msg }),
@@ -296,11 +315,15 @@ handle_next_action(State=#state_rcv{count=0}) ->
     {stop, normal, State};
 handle_next_action(State) ->
     Count = State#state_rcv.count-1,
-    case set_profile(State#state_rcv.maxcount,State#state_rcv.count,State#state_rcv.profile) of
+    case set_profile(State#state_rcv.maxcount,State#state_rcv.count,State#state_rcv.session_id) of
         {thinktime, Think} ->
             ?DebugF("Starting new thinktime ~p~n", [Think]),
-            set_thinktime(Think),
-            {next_state, think, State#state_rcv{count=Count}};
+            case (set_thinktime(Think) >= State#state_rcv.hibernate) of
+                true ->
+                    {next_state, think, State#state_rcv{count=Count},hibernate};
+                _ ->
+                    {next_state, think, State#state_rcv{count=Count}}
+            end;
         {transaction, start, Tname} ->
             Now = now(),
             ?LOGF("Starting new transaction ~p (now~p)~n", [Tname,Now], ?INFO),
@@ -318,16 +341,17 @@ handle_next_action(State) ->
             NewState = State#state_rcv{transactions=lists:keydelete(Tname,1,TrList),
                                    count=Count},
             handle_next_action(NewState);
-        {setdynvars,SourceType,Args,Vars} ->
-            Result = set_dynvars(SourceType,Args,Vars,State#state_rcv.dyndata),
-            NewDynVars = lists:zip(Vars,Result),
-            NewDynData = concat_dynvars(NewDynVars, State#state_rcv.dyndata),
+        {setdynvars,SourceType,Args,VarNames} ->
+            DynData=State#state_rcv.dyndata,
+            Result = set_dynvars(SourceType,Args,VarNames,DynData),
+            NewDynVars = ts_dynvars:set(VarNames,Result,DynData#dyndata.dynvars),
+            NewDynData = DynData#dyndata{dynvars=NewDynVars},
             ?DebugF("set dynvars: ~p ~p~n",[NewDynVars, NewDynData]),
             handle_next_action(State#state_rcv{dyndata = NewDynData, count=Count});
         {ctrl_struct,CtrlData} ->
             ctrl_struct(CtrlData,State,Count);
-        Profile=#ts_request{} ->
-            handle_next_request(Profile, State);
+        Request=#ts_request{} ->
+            handle_next_request(Request, State);
         Other ->
             ?LOGF("Error: set profile return value is ~p (count=~p)~n",[Other,Count],?ERR),
             {stop, set_profile_error, State}
@@ -336,18 +360,21 @@ handle_next_action(State) ->
 
 %%----------------------------------------------------------------------
 %% @spec set_dynvars (Type::erlang|random|urandom|file, Args::tuple(),
-%%                    Variables::List(), DynData:record(dyndata)) -> List()
+%%                    Variables::list(), DynData::#dyndata{}) -> list()
 %% @doc setting the value of several dynamic variables at once.
+%% @end
 %%----------------------------------------------------------------------
 set_dynvars(erlang,{Module,Callback},_Vars,DynData) ->
     Module:Callback({self(),DynData#dyndata.dynvars});
+set_dynvars(code,Fun,_Vars,DynData) ->
+    Fun({self(),DynData#dyndata.dynvars});
 set_dynvars(random,{number,Start,End},Vars,_DynData) ->
     lists:map(fun(_) -> integer_to_list(Start+random:uniform(End-Start)) end,Vars);
 set_dynvars(random,{string,Length},Vars,_DynData) ->
     R = fun(_) -> ts_utils:randomstr(Length) end,
     lists:map(R,Vars);
 set_dynvars(urandom,{string,Length},Vars,_DynData) ->
-    %% not random, but much master
+    %% not random, but much faster
     RS= ts_utils:urandomstr(Length),
     N=length(Vars),
     lists:duplicate(N,RS);
@@ -358,10 +385,15 @@ set_dynvars(file,{iter,FileId,Delimiter},_Vars,_DynData) ->
     {ok,Line} = ts_file_server:get_next_line(FileId),
     string:tokens(Line,Delimiter).
 
-%% @spec ctrl_struct(CtrlData::term(),State::record(state_rcv),Count::integer)
+%% @spec ctrl_struct(CtrlData::term(),State::#state_rcv{},Count::integer) ->
+%%          {next_state, NextStateName::atom(), NextState::#state_rcv{}} |
+%%          {next_state, NextStateName::atom(), NextState::#state_rcv{},
+%%                       Timeout::integer() | infinity} |
+%%          {stop, Reason::term(), NewState::#state_rcv{}}
 %% @doc Common code for flow control actions (repeat,for)
 %%      Count is the next action-id, if this action doesn't result
 %%      in a jump to another place
+%% @end
 ctrl_struct(CtrlData,State,Count) ->
     case ctrl_struct_impl(CtrlData,State#state_rcv.dyndata) of
         {next,NewDynData} ->
@@ -379,32 +411,47 @@ ctrl_struct(CtrlData,State,Count) ->
 
 
 %%----------------------------------------------------------------------
-%% @spec ctrl_struct_impl(ControlStruct::term(),DynData:record(dyndata)) -> Result
-%% @type Result = {next,NewDynData::record(dyndata)}
-%%                | {jump,Target::integer(),NewDynData::record(dyndata)}
+%% @spec ctrl_struct_impl(ControlStruct::term(),DynData::#dyndata{}) ->
+%%        {next,NewDynData::#dyndata{}} |
+%%        {jump, Target::integer(), NewDynData::#dyndata{}}
 %% @doc return {next,NewDynData} to continue with the sequential flow,
 %%             {jump,Target,NewDynData} to jump to action number 'Target'
+%% @end
 %%----------------------------------------------------------------------
-ctrl_struct_impl({for_start,InitialValue,VarName},DynData) ->
-    NewDynData = concat_dynvars([{VarName,InitialValue}],DynData),
-    {next,NewDynData};
-ctrl_struct_impl({for_end,VarName,EndValue,Increment,Target},DynData) ->
-    case lists:keysearch(VarName,1,DynData#dyndata.dynvars) of
-        {value,{VarName,EndValue}} -> % Reach final value, end loop
+ctrl_struct_impl({for_start,InitialValue,VarName},DynData=#dyndata{dynvars=DynVars}) ->
+    NewDynVars = ts_dynvars:set(VarName,InitialValue,DynVars),
+    {next,DynData#dyndata{dynvars=NewDynVars}};
+ctrl_struct_impl({for_end,VarName,EndValue,Increment,Target},DynData=#dyndata{dynvars=DynVars}) ->
+    case ts_dynvars:lookup(VarName,DynVars) of
+        {ok,Value}  when Value >= EndValue -> % Reach final value, end loop
             {next,DynData};
-        {value,{VarName,Value}} ->  % New iteration
-            NewValue = integer_to_list(list_to_integer(Value) + Increment),
-            NewDynData = concat_dynvars([{VarName,NewValue}],DynData),
-            {jump,Target,NewDynData}
+        {ok,Value} ->  % New iteration
+            NewValue = Value + Increment,
+            NewDynVars = ts_dynvars:set(VarName,NewValue,DynVars),
+            {jump,Target,DynData#dyndata{dynvars=NewDynVars}}
     end;
 
-ctrl_struct_impl({repeat,RepeatName, _,_,_,_,_,_},DynData=#dyndata{dynvars=undefined}) ->
+
+ctrl_struct_impl({if_start,Rel, VarName, Value, Target},DynData=#dyndata{dynvars=DynVars}) ->
+    case ts_dynvars:lookup(VarName,DynVars) of
+        {ok,VarValue} ->
+            ?DebugF("If found ~p; value is ~p~n",[VarName,VarValue]),
+            ?DebugF("Calling need_jump with args ~p ~p ~p~n",[Rel,Value,VarValue]),
+            Jump = need_jump('if',rel(Rel,Value,VarValue)),
+            jump_if(Jump,Target,DynData#dyndata{dynvars=DynVars});
+        false ->
+            ts_mon:add({ count, 'error_if_undef'}),
+            {next,DynData}
+    end;
+
+ctrl_struct_impl({repeat,RepeatName, _,_,_,_,_,_},DynData=#dyndata{dynvars=[]}) ->
     Msg= list_to_atom("error_repeat_"++atom_to_list(RepeatName)++"_undef"),
     ts_mon:add({ count, Msg}),
     {next,DynData};
-ctrl_struct_impl({repeat,RepeatName, While,Rel,VarName,Value,Target,Max},DynData) ->
-    Iteration = case lists:keysearch(RepeatName,1,DynData#dyndata.dynvars) of
-                    {value,{RepeatName,Val}} -> Val;
+ctrl_struct_impl({repeat,RepeatName, While,Rel,VarName,Value,Target,Max},
+                 DynData=#dyndata{dynvars=DynVars}) ->
+    Iteration = case ts_dynvars:lookup(RepeatName,DynVars) of
+                    {ok,Val} -> Val;
                     false ->  1
                 end,
     ?DebugF("Repeat (name=~p) iteration: ~p~n",[RepeatName,Iteration]),
@@ -414,15 +461,16 @@ ctrl_struct_impl({repeat,RepeatName, While,Rel,VarName,Value,Target,Max},DynData
             ts_mon:add({ count, max_repeat}),
             {next,DynData};
         false ->
-            case lists:keysearch(VarName,1,DynData#dyndata.dynvars) of
-                {value,{VarName,VarValue}} ->
+            case ts_dynvars:lookup(VarName,DynVars) of
+                {ok,VarValue} ->
                     ?DebugF("Repeat (name=~p) found; value is ~p~n",[VarName,VarValue]),
+                    ?DebugF("Calling need_jump with args ~p ~p ~p ~p~n",[While,Rel,Value,VarValue]),
                     Jump = need_jump(While,rel(Rel,Value,VarValue)),
                     NewValue = 1 + Iteration,
-                    NewDynData = concat_dynvars([{RepeatName,NewValue}],DynData),
-                   jump_if(Jump,Target,NewDynData);
+                    NewDynVars = ts_dynvars:set(RepeatName,NewValue,DynVars),
+                    jump_if(Jump,Target,DynData#dyndata{dynvars=NewDynVars});
                 false ->
-                    Msg= list_to_atom("error_repeat_"++RepeatName++"undef"),
+                    Msg= list_to_atom("error_repeat_"++atom_to_list(RepeatName)++"undef"),
                     ts_mon:add({ count, Msg}),
                     {next,DynData}
             end
@@ -432,7 +480,8 @@ rel('eq',A,B)  -> A == B;
 rel('neq',A,B) -> A /= B.
 
 need_jump('while',F) -> F;
-need_jump('until',F) -> not F.
+need_jump('until',F) -> not F;
+need_jump('if',F) -> not F.
 
 jump_if(true,Target,DynData)   -> {jump,Target,DynData};
 jump_if(false,_Target,DynData) -> {next,DynData}.
@@ -440,13 +489,13 @@ jump_if(false,_Target,DynData) -> {next,DynData}.
 
 %%----------------------------------------------------------------------
 %% Func: handle_next_request/2
-%% Args: Profile, State
+%% Args: Request, State
 %%----------------------------------------------------------------------
-handle_next_request(Profile, State) ->
+handle_next_request(Request, State) ->
     Count = State#state_rcv.count-1,
     Type  = State#state_rcv.clienttype,
 
-    {PrevHost, PrevPort, PrevProto} = case Profile of
+    {PrevHost, PrevPort, PrevProto} = case Request of
         #ts_request{host=undefined, port=undefined, scheme=undefined} ->
             %% host/port/scheme not defined in request, use the current ones.
             {State#state_rcv.host,State#state_rcv.port, State#state_rcv.protocol};
@@ -455,9 +504,9 @@ handle_next_request(Profile, State) ->
     end,
 
     {Param, {Host,Port,Protocol}} =
-        case Type:add_dynparams(Profile#ts_request.subst,
+        case Type:add_dynparams(Request#ts_request.subst,
                                 State#state_rcv.dyndata,
-                                Profile#ts_request.param,
+                                Request#ts_request.param,
                                 {PrevHost, PrevPort}) of
             {Par, NewServer} -> % substitution has changed server setup
                 ?DebugF("Dynparam, new server:  ~p~n",[NewServer]),
@@ -497,13 +546,13 @@ handle_next_request(Profile, State) ->
                     NewState = State#state_rcv{socket   = NewSocket,
                                                protocol = Protocol,
                                                host     = Host,
-                                               request  = Profile,
+                                               request  = Request,
                                                port     = Port,
                                                count    = Count,
                                                page_timestamp= PageTimeStamp,
                                                send_timestamp= Now,
                                                timestamp= Now },
-                    case Profile#ts_request.ack of
+                    case Request#ts_request.ack of
                         no_ack ->
                             {PTimeStamp, _} = update_stats_noack(NewState),
                             handle_next_action(NewState#state_rcv{ack_done=true, page_timestamp=PTimeStamp});
@@ -523,7 +572,7 @@ handle_next_request(Profile, State) ->
                     ?LOGF("Error: Unable to send data, reason: ~p~n",[Reason],?ERR),
                     CountName="error_send_"++atom_to_list(Reason),
                     ts_mon:add({ count, list_to_atom(CountName) }),
-                    {stop, normal, State};
+                     handle_timeout_while_sending(State);
                 {'EXIT', {noproc, _Rest}} ->
                     ?LOG("EXIT from ssl app while sending message !~n", ?WARN),
                     handle_close_while_sending(State#state_rcv{socket=NewSocket,
@@ -536,8 +585,16 @@ handle_next_request(Profile, State) ->
                     ts_mon:add({ count, error_send }),
                     {stop, normal, State}
             end;
-        _Error ->
-            {stop, normal, State} %% already log in reconnect
+        {error,_Reason} when State#state_rcv.retries < ?MAX_RETRIES ->
+            Retries= State#state_rcv.retries +1,
+            % simplified exponential backoff algorithm: we increase
+            % the timeout when the number of retries increase, with a
+            % simple rule: number of retries * retry_timeout
+            set_thinktime(?RETRY_TIMEOUT *  Retries ),
+            {next_state, think, State#state_rcv{retries=Retries}};
+        {error,_Reason}  ->
+            ts_mon:add({ count, error_abort_max_conn_retries }),
+            {stop, normal, State}
     end.
 
 %%----------------------------------------------------------------------
@@ -548,7 +605,7 @@ finish_session(State) ->
     Now = now(),
     set_connected_status(false),
     Elapsed = ts_utils:elapsed(State#state_rcv.starttime, Now),
-    ts_mon:endclient({self(), Now, Elapsed}).
+    ts_mon:endclient({State#state_rcv.id, Now, Elapsed}).
 
 %%----------------------------------------------------------------------
 %% Func: handle_close_while_sending/1
@@ -573,6 +630,21 @@ handle_close_while_sending(State) ->
 
 
 %%----------------------------------------------------------------------
+%% Func: handle_timeout_while_sending/1
+%% Args: State
+%% Purpose: retry if a timeout occurs during a send
+%%----------------------------------------------------------------------
+handle_timeout_while_sending(State=#state_rcv{persistent = true,
+                                              proto_opts = PO})->
+    Think = PO#proto_opts.retry_timeout,
+    set_thinktime(Think),
+    {next_state, think, State};
+handle_timeout_while_sending(State) ->
+    ?LOG("Not persistent, abort client because of send timeout~n", ?INFO),
+    {stop, normal, State}.
+
+
+%%----------------------------------------------------------------------
 %% Func: set_profile/2
 %% Args: MaxCount, Count (integer), ProfileId (integer)
 %%----------------------------------------------------------------------
@@ -585,10 +657,10 @@ set_profile(MaxCount, Count, ProfileId) when is_integer(ProfileId) ->
 %%          {stop, Reason}
 %% purpose: try to reconnect if this is needed (when the socket is set to none)
 %%----------------------------------------------------------------------
-reconnect(none, ServerName, Port, {Protocol, Proto_opts}, IP) ->
+reconnect(none, ServerName, Port, {Protocol, Proto_opts}, {IP,CPort}) ->
     ?DebugF("Try to (re)connect to: ~p:~p from ~p using protocol ~p~n",
             [ServerName,Port,IP,Protocol]),
-    Opts = protocol_options(Protocol, Proto_opts)  ++ [{ip, IP}],
+    Opts = protocol_options(Protocol, Proto_opts)  ++ [{ip, IP},{port,CPort}],
     Before= now(),
     case connect(Protocol,ServerName, Port, Opts) of
         {ok, Socket} ->
@@ -603,7 +675,7 @@ reconnect(none, ServerName, Port, {Protocol, Proto_opts}, IP) ->
                   [A,B,C,D, ServerName, Port, Reason],?ERR),
             CountName="error_connect_"++atom_to_list(Reason),
             ts_mon:add({ count, list_to_atom(CountName) }),
-            {stop, normal}
+            {error, Reason}
     end;
 reconnect(Socket, _Server, _Port, _Protocol, _IP) ->
     {ok, Socket}.
@@ -621,13 +693,9 @@ send(gen_udp,Socket,Message,Host,Port) ->gen_udp:send(Socket,Host,Port,Message).
 %% Func: connect/4
 %% Return: {ok, Socket} | {error, Reason}
 %%----------------------------------------------------------------------
-connect(gen_tcp,Server, Port, Opts) -> gen_tcp:connect(Server, Port, Opts);
-connect(ssl,Server, Port,Opts)      -> ssl:connect(Server, Port, Opts);
-connect(gen_udp,_Server, _Port, Opts) ->
-    %%FIXME: temporary hack; we need a unique port for each client using the same source IP
-    ClientPort=random:uniform(64511)+1024,
-    ?LOGF("Open UDP port number ~p, opts =~p~n",[ClientPort, Opts],?DEB),
-    gen_udp:open(ClientPort,Opts).
+connect(gen_tcp,Server, Port, Opts)  -> gen_tcp:connect(Server, Port, Opts);
+connect(ssl,Server, Port,Opts)       -> ssl:connect(Server, Port, Opts);
+connect(gen_udp,_Server, _Port, Opts)-> gen_udp:open(0,Opts).
 
 
 %%----------------------------------------------------------------------
@@ -654,11 +722,14 @@ protocol_options(gen_udp,#proto_opts{udp_rcv_size=Rcv, udp_snd_size=Snd}) ->
      {sndbuf, Snd}
     ].
 
+
+
 %%----------------------------------------------------------------------
 %% Func: set_thinktime/1
 %% Purpose: set a timer for thinktime if it is not infinite
+%%          returns the choosen thinktime in msec
 %%----------------------------------------------------------------------
-set_thinktime(infinity) -> ok;
+set_thinktime(infinity) -> infinity;
 set_thinktime({random, Think}) ->
     set_thinktime(round(ts_stats:exponential(1/Think)));
 set_thinktime({range, Min, Max}) ->
@@ -667,7 +738,8 @@ set_thinktime(Think) ->
 %% dot not use timer:send_after because it does not scale well:
 %% http://www.erlang.org/ml-archive/erlang-questions/200202/msg00024.html
     ?DebugF("thinktime of ~p~n",[Think]),
-    erlang:start_timer(Think, self(), end_thinktime ).
+    erlang:start_timer(Think, self(), end_thinktime ),
+    Think.
 
 
 %%----------------------------------------------------------------------
@@ -681,7 +753,7 @@ handle_data_msg(Data, State=#state_rcv{request=Req}) when Req#ts_request.ack==no
     ts_mon:rcvmes({State#state_rcv.dump, self(), Data}),
     {State, []};
 
-handle_data_msg(Data,State=#state_rcv{request=Req, clienttype=Type, maxcount=MaxCount})
+handle_data_msg(Data,State=#state_rcv{request=Req,clienttype=Type,maxcount=MaxCount})
   when Req#ts_request.ack==parse->
     ts_mon:rcvmes({State#state_rcv.dump, self(), Data}),
 
@@ -693,8 +765,12 @@ handle_data_msg(Data,State=#state_rcv{request=Req, clienttype=Type, maxcount=Max
         true ->
             ?DebugF("Response done:~p~n", [NewState#state_rcv.datasize]),
             {PageTimeStamp, DynVars} = update_stats(NewState#state_rcv{buffer=NewBuffer}),
-            NewCount = ts_search:match(Req#ts_request.match, NewBuffer, {NewState#state_rcv.count, MaxCount}),
-            NewDynData = concat_dynvars(DynVars, NewState#state_rcv.dyndata),
+            MatchArgs={NewState#state_rcv.count, MaxCount,
+                       NewState#state_rcv.session_id,
+                       NewState#state_rcv.id},
+            NewCount =ts_search:match(Req#ts_request.match,NewBuffer,MatchArgs,DynVars),
+            NewDynVars=ts_dynvars:merge(DynVars,(NewState#state_rcv.dyndata)#dyndata.dynvars),
+            NewDynData=(NewState#state_rcv.dyndata)#dyndata{dynvars=NewDynVars},
             case Close of
                 true ->
                     ?Debug("Close connection required by protocol~n"),
@@ -758,8 +834,11 @@ handle_data_msg(Data, State=#state_rcv{request=Req, maxcount= MaxCount}) ->
     DataSize = size(Data),
     {PageTimeStamp, DynVars} = update_stats(State#state_rcv{datasize=DataSize,
                                                             buffer=NewBuffer}),
-    NewCount = ts_search:match(Req#ts_request.match, NewBuffer, {State#state_rcv.count,MaxCount}),
-    NewDynData = concat_dynvars(DynVars, State#state_rcv.dyndata),
+    MatchArgs={State#state_rcv.count,MaxCount,State#state_rcv.session_id,
+               State#state_rcv.id},
+    NewCount = ts_search:match(Req#ts_request.match, NewBuffer, MatchArgs,DynVars),
+    NewDynVars=ts_dynvars:merge(DynVars,(State#state_rcv.dyndata)#dyndata.dynvars),
+    NewDynData=(State#state_rcv.dyndata)#dyndata{dynvars=NewDynVars},
     {State#state_rcv{ack_done = true, buffer= NewBuffer, dyndata = NewDynData,
                      page_timestamp= PageTimeStamp, count=NewCount},[]}.
 
@@ -767,7 +846,7 @@ handle_data_msg(Data, State=#state_rcv{request=Req, maxcount= MaxCount}) ->
 %%----------------------------------------------------------------------
 %% Func: set_new_buffer/3
 %%----------------------------------------------------------------------
-set_new_buffer(#ts_request{match=[], dynvar_specs=undefined},_,_) ->
+set_new_buffer(#ts_request{match=[], dynvar_specs=[]},_,_) ->
     << >>;
 set_new_buffer(_, Buffer,closed) ->
     Buffer;
@@ -787,10 +866,10 @@ set_connected_status(true, true) ->
     ok;
 set_connected_status(true, Old) when Old==undefined; Old==false ->
     put(connected,true),
-    ts_mon:add(nocache,{sum, connected, 1});
+    ts_mon:add({sum, connected, 1});
 set_connected_status(false, true) ->
     put(connected,false),
-    ts_mon:add(nocache,{sum, connected, -1});
+    ts_mon:add({sum, connected, -1});
 set_connected_status(false, Old) when Old==undefined; Old==false ->
     ok.
 
@@ -801,10 +880,10 @@ set_connected_status(false, Old) when Old==undefined; Old==false ->
 %% Returns: {TimeStamp, DynVars}
 %% Purpose: update the statistics for no_ack requests
 %%----------------------------------------------------------------------
-update_stats_noack(#state_rcv{page_timestamp=PageTime,request=Profile}) ->
+update_stats_noack(#state_rcv{page_timestamp=PageTime,request=Request}) ->
     Now = now(),
     Stats= [{ count, request_noack}], % count and not sample because response time is not defined in this case
-    case Profile#ts_request.endpage of
+    case Request#ts_request.endpage of
         true -> % end of a page, compute page reponse time
             PageElapsed = ts_utils:elapsed(PageTime, Now),
             ts_mon:add(lists:append([Stats,[{sample, page, PageElapsed}]])),
@@ -832,10 +911,10 @@ update_stats(State=#state_rcv{page_timestamp=PageTime,send_timestamp=SendTime}) 
                     [{ sample, request, Elapsed},
                      { sum, size_rcv, State#state_rcv.datasize}]
             end,
-    Profile = State#state_rcv.request,
-    DynVars = ts_search:parse_dynvar(Profile#ts_request.dynvar_specs,
+    Request = State#state_rcv.request,
+    DynVars = ts_search:parse_dynvar(Request#ts_request.dynvar_specs,
                                      State#state_rcv.buffer),
-    case Profile#ts_request.endpage of
+    case Request#ts_request.endpage of
         true -> % end of a page, compute page reponse time
             PageElapsed = ts_utils:elapsed(PageTime, Now),
             ts_mon:add(lists:append([Stats,[{sample, page, PageElapsed}]])),
@@ -845,12 +924,3 @@ update_stats(State=#state_rcv{page_timestamp=PageTime,send_timestamp=SendTime}) 
             {PageTime, DynVars}
     end.
 
-%%----------------------------------------------------------------------
-%% Func: concat_dynvars/2
-%%----------------------------------------------------------------------
-concat_dynvars(DynData, undefined)  -> #dyndata{dynvars=DynData};
-concat_dynvars([], DynData) -> DynData;
-concat_dynvars(DynVars, DynData=#dyndata{dynvars=undefined}) ->
-    DynData#dyndata{dynvars=DynVars};
-concat_dynvars(DynVars, DynData=#dyndata{dynvars=OldDynVars}) ->
-    DynData#dyndata{dynvars=ts_utils:keyumerge(1,DynVars,OldDynVars)}.
